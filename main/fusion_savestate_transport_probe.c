@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -99,6 +100,8 @@ typedef struct {
     bool reduced_logging;
     bool boot_mode;
     bool capture_task;
+    uint16_t wram_chunk_bytes;
+    uint32_t wram_chunk_gap_ms;
 } ProbeConfig_t;
 
 typedef struct {
@@ -949,7 +952,7 @@ static bool ReadRegionRange(const ProbeConfig_t *cfg,
     }
     printf("\n");
     if (chunk_index >= 0) {
-        vTaskDelay(pdMS_TO_TICKS(kProbeWramChunkGapMs));
+        vTaskDelay(pdMS_TO_TICKS(cfg->wram_chunk_gap_ms));
         const uint32_t gap_drain_bytes = DrainUartRxForMs(kProbeBoundaryRawDrainMs);
         ReaderReset(reader);
         PrintWramChunkSummary(&stats, "PASS", elapsed_ms, gap_drain_bytes);
@@ -985,15 +988,23 @@ static bool ReadWramChunked(const ProbeConfig_t *cfg,
     memset(data, 0, region->length);
 
     uint32_t total = 0u;
-    const uint16_t chunk_count = region->length / kProbeWramChunkBytes;
+    if (cfg->wram_chunk_bytes == 0u ||
+        (region->length % cfg->wram_chunk_bytes) != 0u) {
+        printf("SvProbe: invalid WRAM chunk size=%u total=%u\n",
+               (unsigned)cfg->wram_chunk_bytes,
+               (unsigned)region->length);
+        return false;
+    }
+
+    const uint16_t chunk_count = region->length / cfg->wram_chunk_bytes;
     printf("SvProbe: WRAM_CHUNKED size=%u gap_ms=%u chunks=%u total=%u\n",
-           (unsigned)kProbeWramChunkBytes,
-           (unsigned)kProbeWramChunkGapMs,
+           (unsigned)cfg->wram_chunk_bytes,
+           (unsigned)cfg->wram_chunk_gap_ms,
            (unsigned)chunk_count,
            (unsigned)region->length);
 
     for (uint16_t i = 0u; i < chunk_count; ++i) {
-        const uint16_t offset = (uint16_t)(i * kProbeWramChunkBytes);
+        const uint16_t offset = (uint16_t)(i * cfg->wram_chunk_bytes);
         const ProbeRegion_t *prev = (i == 0u) ? previous_region : region;
         if (!ReadRegionRange(cfg,
                              reader,
@@ -1001,7 +1012,7 @@ static bool ReadWramChunked(const ProbeConfig_t *cfg,
                              prev,
                              region,
                              offset,
-                             (uint16_t)kProbeWramChunkBytes,
+                             cfg->wram_chunk_bytes,
                              (int)i,
                              &data[offset])) {
             printf("SvProbe: WRAM_CHUNKED FAIL chunks_passed=%u chunks_failed=1 "
@@ -1010,7 +1021,7 @@ static bool ReadWramChunked(const ProbeConfig_t *cfg,
                    (unsigned long)total);
             return false;
         }
-        total += kProbeWramChunkBytes;
+        total += cfg->wram_chunk_bytes;
     }
 
     const uint32_t crc = FusionSavestate_Crc32(data, region->length);
@@ -1215,7 +1226,8 @@ static bool RunProbe(const ProbeConfig_t *cfg)
 
     printf("SvProbe: START mode=%s reduced_logging=%s flash_writes=no "
            "rx_driver_old=%u rx_driver_new=%u local_rx_cache=%u "
-           "capture_task=%s task_prio=%u core=%d\n",
+           "capture_task=%s task_prio=%u core=%d wram_chunk=%u "
+           "wram_gap_ms=%lu\n",
            cfg->mode_name,
            cfg->reduced_logging ? "yes" : "no",
            (unsigned)kProbeOldRxBufBytes,
@@ -1223,7 +1235,9 @@ static bool RunProbe(const ProbeConfig_t *cfg)
            (unsigned)kProbeRxCacheBytes,
            cfg->capture_task ? "yes" : "no",
            (unsigned)uxTaskPriorityGet(NULL),
-           xPortGetCoreID());
+           xPortGetCoreID(),
+           (unsigned)cfg->wram_chunk_bytes,
+           (unsigned long)cfg->wram_chunk_gap_ms);
 
     bool ok = RunPreflight(cfg, &reader, &failure, &preflight);
     if (ok) {
@@ -1283,6 +1297,8 @@ bool FusionSavestateTransportProbe_RunRepl(bool reduced_logging)
         .reduced_logging = reduced_logging,
         .boot_mode = false,
         .capture_task = false,
+        .wram_chunk_bytes = (uint16_t)kProbeWramChunkBytes,
+        .wram_chunk_gap_ms = kProbeWramChunkGapMs,
     };
     return RunProbe(&cfg);
 }
@@ -1295,7 +1311,10 @@ static void ProbeCaptureTask(void *arg)
     vTaskDelete(NULL);
 }
 
-static bool RunCaptureTask(const char *mode_name, bool reduced_logging)
+static bool RunCaptureTask(const char *mode_name,
+                           bool reduced_logging,
+                           uint16_t wram_chunk_bytes,
+                           uint32_t wram_chunk_gap_ms)
 {
     ProbeTaskRequest_t request = {
         .cfg = {
@@ -1303,6 +1322,8 @@ static bool RunCaptureTask(const char *mode_name, bool reduced_logging)
             .reduced_logging = reduced_logging,
             .boot_mode = false,
             .capture_task = true,
+            .wram_chunk_bytes = wram_chunk_bytes,
+            .wram_chunk_gap_ms = wram_chunk_gap_ms,
         },
         .caller = xTaskGetCurrentTaskHandle(),
         .ok = false,
@@ -1333,6 +1354,8 @@ void FusionSavestateTransportProbe_RunBootProbeOnce(void)
         .reduced_logging = true,
         .boot_mode = true,
         .capture_task = false,
+        .wram_chunk_bytes = (uint16_t)kProbeWramChunkBytes,
+        .wram_chunk_gap_ms = kProbeWramChunkGapMs,
     };
     (void)RunProbe(&cfg);
 }
@@ -1341,6 +1364,8 @@ static int ProbeCommand(int argc, char **argv)
 {
     const char *mode_name = "repl";
     bool reduced_logging = false;
+    uint16_t wram_chunk_bytes = (uint16_t)kProbeWramChunkBytes;
+    uint32_t wram_chunk_gap_ms = kProbeWramChunkGapMs;
     if (argc >= 2) {
         if (strcmp(argv[1], "menu") == 0) {
             mode_name = "menu";
@@ -1352,18 +1377,42 @@ static int ProbeCommand(int argc, char **argv)
             mode_name = "repl-quiet";
             reduced_logging = true;
         } else if (strcmp(argv[1], "repl") != 0) {
-            printf("Usage: svprobe [menu|game|repl|quiet]\n");
+            printf("Usage: svprobe [menu|game|repl|quiet] [wram_chunk_bytes gap_ms]\n");
             return 1;
         }
     }
-    return RunCaptureTask(mode_name, reduced_logging) ? 0 : 1;
+    if (argc >= 4) {
+        char *end = NULL;
+        const unsigned long chunk = strtoul(argv[2], &end, 0);
+        if (end == argv[2] || *end != '\0' ||
+            chunk == 0u || chunk > UINT16_MAX ||
+            (32768u % chunk) != 0u) {
+            printf("SvProbe: invalid WRAM chunk bytes '%s'\n", argv[2]);
+            return 1;
+        }
+        end = NULL;
+        const unsigned long gap = strtoul(argv[3], &end, 0);
+        if (end == argv[3] || *end != '\0' || gap > 10000u) {
+            printf("SvProbe: invalid WRAM gap ms '%s'\n", argv[3]);
+            return 1;
+        }
+        wram_chunk_bytes = (uint16_t)chunk;
+        wram_chunk_gap_ms = (uint32_t)gap;
+    } else if (argc == 3) {
+        printf("Usage: svprobe [menu|game|repl|quiet] [wram_chunk_bytes gap_ms]\n");
+        return 1;
+    }
+    return RunCaptureTask(mode_name,
+                          reduced_logging,
+                          wram_chunk_bytes,
+                          wram_chunk_gap_ms) ? 0 : 1;
 }
 
 void FusionSavestateTransportProbe_RegisterCommands(void)
 {
     const esp_console_cmd_t command = {
         .command = "svprobe",
-        .help = "Phase 4.8a read-transport probe: svprobe [menu|game|repl|quiet]",
+        .help = "Phase 4.8a read-transport probe: svprobe [menu|game|repl|quiet] [chunk gap_ms]",
         .func = &ProbeCommand,
         .argtable = NULL,
     };
