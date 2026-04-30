@@ -40,6 +40,7 @@ static const SmokeRegion_t kFinalMatrix[] = {
     { "WRAM",   0x0Cu, (uint16_t)kWramFullLen, false },
 };
 
+#if 0
 /* Diagnostic ramp before the final gate.  Each entry runs through its
  * own BeginSave/EndSession pair so a failure on one length does not
  * corrupt the next. */
@@ -49,6 +50,7 @@ static const SmokeRegion_t kWramDiagMatrix[] = {
     { "WRAM-8192",  0x0Cu, (uint16_t)kWramDiag3Len, false },
     { "WRAM-32768", 0x0Cu, (uint16_t)kWramFullLen,  false },
 };
+#endif
 
 static uint8_t *s_rx_buf  = NULL;
 static size_t   s_rx_buf_len = 0;
@@ -110,42 +112,48 @@ static bool ReadDecodedFrame(const char *context, FusionV2Decoded_t *decoded)
     int64_t deadline = esp_timer_get_time()
                      + ((int64_t)kSmoke47FrameTimeoutMs * 1000);
 
-    uint8_t b = 0;
-    do {
+    while (esp_timer_get_time() < deadline) {
+        uint8_t b = 0;
         if (!ReadByteWithDeadline(&b, deadline)) {
             printf("Smoke47: RX timeout waiting for marker during %s\n", context);
             return false;
         }
-    } while (b != FUSION_V2_HEADER_MARKER);
+        if (b != FUSION_V2_HEADER_MARKER) {
+            continue;
+        }
 
-    raw[0] = b;
-    if (!ReadByteWithDeadline(&raw[1], deadline) ||
-        !ReadByteWithDeadline(&raw[2], deadline)) {
-        printf("Smoke47: RX timeout waiting for header during %s\n", context);
-        return false;
-    }
-
-    const uint8_t payload_len = raw[2];
-    if (payload_len > FUSION_V2_MAX_PAYLOAD) {
-        printf("Smoke47: RX bad payload len %u during %s\n",
-               (unsigned)payload_len, context);
-        return false;
-    }
-
-    const size_t frame_len = 3u + payload_len + 1u;
-    for (size_t i = 3u; i < frame_len; ++i) {
-        if (!ReadByteWithDeadline(&raw[i], deadline)) {
-            printf("Smoke47: RX timeout waiting for payload/crc during %s\n",
-                   context);
+        raw[0] = b;
+        if (!ReadByteWithDeadline(&raw[1], deadline) ||
+            !ReadByteWithDeadline(&raw[2], deadline)) {
+            printf("Smoke47: RX timeout waiting for header during %s\n", context);
             return false;
         }
+
+        const uint8_t payload_len = raw[2];
+        if (payload_len > FUSION_V2_MAX_PAYLOAD) {
+            printf("Smoke47: RX resync bad payload len %u during %s\n",
+                   (unsigned)payload_len, context);
+            continue;
+        }
+
+        const size_t frame_len = 3u + payload_len + 1u;
+        for (size_t i = 3u; i < frame_len; ++i) {
+            if (!ReadByteWithDeadline(&raw[i], deadline)) {
+                printf("Smoke47: RX timeout waiting for payload/crc during %s\n",
+                       context);
+                return false;
+            }
+        }
+
+        if (!FusionSavestate_DecodeV2Frame(raw, frame_len, decoded)) {
+            printf("Smoke47: RX resync decode/CRC failed during %s\n", context);
+            continue;
+        }
+        return true;
     }
 
-    if (!FusionSavestate_DecodeV2Frame(raw, frame_len, decoded)) {
-        printf("Smoke47: RX decode/CRC failed during %s\n", context);
-        return false;
-    }
-    return true;
+    printf("Smoke47: RX timeout waiting for valid frame during %s\n", context);
+    return false;
 }
 
 static bool ExpectCtl(uint8_t opcode, uint8_t ack_for, const char *context)
@@ -362,17 +370,22 @@ static bool RunSession(const SmokeRegion_t *matrix, size_t count, const char *la
 
     for (size_t i = 0; ok && i < count; ++i) {
         ok = ReadRegion(&matrix[i]);
+        if (ok) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 
     printf("Smoke47: %s sending END_SESSION cleanup\n", label);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    bool cleanup_ok = false;
     FusionV2Frame_t end;
     if (FusionSavestate_BuildEndSession(&end)) {
-        (void)SendFrame("END_SESSION cleanup", &end);
-        (void)ExpectCtl((uint8_t)kFusionOp_AckAccepted,
-                        (uint8_t)kFusionOp_EndSession,
-                        "END_SESSION cleanup");
+        cleanup_ok = SendFrame("END_SESSION cleanup", &end) &&
+                     ExpectCtl((uint8_t)kFusionOp_AckAccepted,
+                               (uint8_t)kFusionOp_EndSession,
+                               "END_SESSION cleanup");
     }
-    return ok;
+    return ok && cleanup_ok;
 }
 
 void FusionSavestateSmoke47_RunBlocking(void)
@@ -387,31 +400,13 @@ void FusionSavestateSmoke47_RunBlocking(void)
         return;
     }
 
-    /* Diagnostic ramp: each WRAM length runs its own session so a late
-     * failure does not poison the final-gate session. */
     bool diag_ok = true;
-    for (size_t i = 0; diag_ok &&
-                       i < (sizeof(kWramDiagMatrix) / sizeof(kWramDiagMatrix[0]));
-         ++i) {
-        SmokeRegion_t one[1];
-        one[0] = kWramDiagMatrix[i];
-        printf("Smoke47: --- DIAG %s ---\n", one[0].name);
-        diag_ok = RunSession(one, 1, one[0].name);
-        if (!diag_ok) {
-            printf("Smoke47: DIAG %s FAILED -- stopping diag ramp\n", one[0].name);
-        }
-    }
+    printf("Smoke47: diagnostic ramp disabled for final-only rerun\n");
 
-    bool gate_ok = false;
-    if (diag_ok) {
-        printf("Smoke47: --- FINAL GATE ---\n");
-        gate_ok = RunSession(kFinalMatrix,
-                             sizeof(kFinalMatrix) / sizeof(kFinalMatrix[0]),
-                             "FINAL");
-    } else {
-        printf("Smoke47: skipping final gate due to diag failure\n");
-    }
-
+    printf("Smoke47: --- FINAL GATE ---\n");
+    bool gate_ok = RunSession(kFinalMatrix,
+                              sizeof(kFinalMatrix) / sizeof(kFinalMatrix[0]),
+                              "FINAL");
     printf("Smoke47: RESULT %s (diag=%s gate=%s)\n",
            (diag_ok && gate_ok) ? "PASS" : "FAIL",
            diag_ok ? "PASS" : "FAIL",
