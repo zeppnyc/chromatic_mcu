@@ -29,6 +29,10 @@ enum {
     kProbeOldRxBufBytes  = 1024,
     kProbeCaptureStackBytes = 12288,
     kProbeCapturePriority = configMAX_PRIORITIES - 2,
+    kProbeOwnerAcquireMs = 1000,
+    kProbePreflightDrainMs = 60,
+    kProbeCleanupAckMs = 500,
+    kProbePostCleanupDrainMs = 60,
 };
 
 static const char *TAG = "SvProbe";
@@ -56,6 +60,25 @@ typedef struct {
     bool boot_mode;
     bool capture_task;
 } ProbeConfig_t;
+
+typedef struct {
+    bool tx_paused;
+    bool rx_paused;
+    bool lvgl_paused;
+} ProbePauseState_t;
+
+typedef struct {
+    bool owner_acquired;
+    bool cleanup_ack;
+    bool begin_save_ack;
+    uint32_t initial_drain_bytes;
+    uint32_t post_cleanup_drain_bytes;
+    uint32_t stale_frames_during_cleanup;
+    uint32_t skipped_non_marker;
+    uint32_t bad_payload_len;
+    uint32_t bad_crc;
+    ProbePauseState_t pause;
+} ProbePreflight_t;
 
 typedef struct {
     ProbeConfig_t cfg;
@@ -100,6 +123,12 @@ static size_t s_rx_buf_len = 0u;
 static bool s_lvgl_suspended = false;
 
 extern TaskHandle_t FusionApp_GetLvglTimerTaskHandle(void);
+
+static bool ReadDecodedFrameWithTimeout(ProbeReader_t *reader,
+                                        const char *context,
+                                        uint32_t timeout_ms,
+                                        bool print_timeout,
+                                        FusionV2Decoded_t *decoded);
 
 static bool EnsureRxBuf(uint16_t need)
 {
@@ -226,14 +255,29 @@ static bool ReadDecodedFrame(ProbeReader_t *reader,
                              const char *context,
                              FusionV2Decoded_t *decoded)
 {
+    return ReadDecodedFrameWithTimeout(reader,
+                                       context,
+                                       kProbeFrameTimeoutMs,
+                                       true,
+                                       decoded);
+}
+
+static bool ReadDecodedFrameWithTimeout(ProbeReader_t *reader,
+                                        const char *context,
+                                        uint32_t timeout_ms,
+                                        bool print_timeout,
+                                        FusionV2Decoded_t *decoded)
+{
     uint8_t raw[FUSION_V2_MAX_FRAME] = {0};
     const int64_t deadline = esp_timer_get_time()
-                           + ((int64_t)kProbeFrameTimeoutMs * 1000);
+                           + ((int64_t)timeout_ms * 1000);
 
     while (esp_timer_get_time() < deadline) {
         uint8_t b = 0u;
         if (!ReaderByte(reader, &b, deadline)) {
-            printf("SvProbe: RX timeout waiting for marker during %s\n", context);
+            if (print_timeout) {
+                printf("SvProbe: RX timeout waiting for marker during %s\n", context);
+            }
             return false;
         }
         if (b != FUSION_V2_HEADER_MARKER) {
@@ -244,7 +288,9 @@ static bool ReadDecodedFrame(ProbeReader_t *reader,
         raw[0] = b;
         if (!ReaderByte(reader, &raw[1], deadline) ||
             !ReaderByte(reader, &raw[2], deadline)) {
-            printf("SvProbe: RX timeout waiting for header during %s\n", context);
+            if (print_timeout) {
+                printf("SvProbe: RX timeout waiting for header during %s\n", context);
+            }
             return false;
         }
 
@@ -259,8 +305,10 @@ static bool ReadDecodedFrame(ProbeReader_t *reader,
         const size_t frame_len = 3u + payload_len + 1u;
         for (size_t i = 3u; i < frame_len; ++i) {
             if (!ReaderByte(reader, &raw[i], deadline)) {
-                printf("SvProbe: RX timeout waiting for payload/crc during %s\n",
-                       context);
+                if (print_timeout) {
+                    printf("SvProbe: RX timeout waiting for payload/crc during %s\n",
+                           context);
+                }
                 return false;
             }
         }
@@ -273,7 +321,9 @@ static bool ReadDecodedFrame(ProbeReader_t *reader,
         return true;
     }
 
-    printf("SvProbe: RX timeout waiting for valid frame during %s\n", context);
+    if (print_timeout) {
+        printf("SvProbe: RX timeout waiting for valid frame during %s\n", context);
+    }
     return false;
 }
 
@@ -542,36 +592,34 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
     return true;
 }
 
-static void PauseNormalUartTasks(void)
+static ProbePauseState_t PauseNormalUartTasks(void)
 {
     TaskHandle_t *tx = FPGA_GetTxTaskHandle();
     TaskHandle_t *rx = FPGA_GetRxTaskHandle();
-    bool tx_paused = false;
-    bool rx_paused = false;
-    bool lvgl_paused = false;
+    ProbePauseState_t pause = {0};
 
     TaskHandle_t lvgl = FusionApp_GetLvglTimerTaskHandle();
     if (lvgl != NULL && lvgl != xTaskGetCurrentTaskHandle()) {
         vTaskSuspend(lvgl);
-        lvgl_paused = true;
+        pause.lvgl_paused = true;
         s_lvgl_suspended = true;
     } else {
         s_lvgl_suspended = false;
     }
     if (tx != NULL && *tx != NULL) {
         FPGA_Tx_Pause();
-        tx_paused = true;
+        pause.tx_paused = true;
     }
     if (rx != NULL && *rx != NULL) {
         FPGA_Rx_Pause();
-        rx_paused = true;
+        pause.rx_paused = true;
     }
     vTaskDelay(pdMS_TO_TICKS(30));
-    uart_flush(UART_NUM_1);
     printf("SvProbe: PAUSE tx=%s rx=%s lvgl=%s\n",
-           tx_paused ? "yes" : "no",
-           rx_paused ? "yes" : "no",
-           lvgl_paused ? "yes" : "no");
+           pause.tx_paused ? "yes" : "no",
+           pause.rx_paused ? "yes" : "no",
+           pause.lvgl_paused ? "yes" : "no");
+    return pause;
 }
 
 static void ResumeNormalUartTasks(void)
@@ -593,12 +641,147 @@ static void ResumeNormalUartTasks(void)
     }
 }
 
+static uint32_t DrainUartRxForMs(uint32_t duration_ms)
+{
+    uint8_t tmp[128];
+    uint32_t total = 0u;
+    const int64_t deadline = esp_timer_get_time() + ((int64_t)duration_ms * 1000);
+    while (esp_timer_get_time() < deadline) {
+        const int got = uart_read_bytes(UART_NUM_1,
+                                        tmp,
+                                        sizeof(tmp),
+                                        pdMS_TO_TICKS(2));
+        if (got > 0) {
+            total += (uint32_t)got;
+        }
+    }
+    return total;
+}
+
+static bool WaitPreflightCleanupAck(ProbeReader_t *reader,
+                                    ProbePreflight_t *preflight)
+{
+    const uint32_t bad_len0 = reader->bad_payload_len;
+    const uint32_t bad_crc0 = reader->bad_crc;
+    const uint32_t skipped0 = reader->skipped_non_marker;
+    const int64_t deadline = esp_timer_get_time()
+                           + ((int64_t)kProbeCleanupAckMs * 1000);
+
+    while (esp_timer_get_time() < deadline) {
+        FusionV2Decoded_t d;
+        const int64_t now = esp_timer_get_time();
+        const uint32_t remain_ms =
+            (uint32_t)((deadline > now) ? ((deadline - now + 999) / 1000) : 0);
+        if (remain_ms == 0u ||
+            !ReadDecodedFrameWithTimeout(reader,
+                                         "preflight END_SESSION cleanup",
+                                         remain_ms,
+                                         false,
+                                         &d)) {
+            break;
+        }
+
+        if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
+            d.ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
+            d.ack_for_opcode == (uint8_t)kFusionOp_EndSession) {
+            preflight->cleanup_ack = true;
+            break;
+        }
+
+        preflight->stale_frames_during_cleanup++;
+    }
+
+    preflight->bad_payload_len = reader->bad_payload_len - bad_len0;
+    preflight->bad_crc = reader->bad_crc - bad_crc0;
+    preflight->skipped_non_marker = reader->skipped_non_marker - skipped0;
+    return preflight->cleanup_ack &&
+           preflight->bad_payload_len == 0u &&
+           preflight->bad_crc == 0u;
+}
+
+static void PrintPreflight(const ProbePreflight_t *preflight)
+{
+    printf("SvProbe: PREFLIGHT owner_acquired=%s normal_tasks_paused=%s "
+           "initial_drain_bytes=%lu cleanup_ack=%s "
+           "stale_frames_during_cleanup=%lu bad_len=%lu bad_crc=%lu "
+           "resync_non_marker=%lu post_cleanup_drain_bytes=%lu "
+           "begin_save_ack=%s\n",
+           preflight->owner_acquired ? "yes" : "no",
+           (preflight->pause.tx_paused && preflight->pause.rx_paused) ? "yes" : "no",
+           (unsigned long)preflight->initial_drain_bytes,
+           preflight->cleanup_ack ? "yes" : "no",
+           (unsigned long)preflight->stale_frames_during_cleanup,
+           (unsigned long)preflight->bad_payload_len,
+           (unsigned long)preflight->bad_crc,
+           (unsigned long)preflight->skipped_non_marker,
+           (unsigned long)preflight->post_cleanup_drain_bytes,
+           preflight->begin_save_ack ? "yes" : "no");
+}
+
+static bool RunPreflight(const ProbeConfig_t *cfg,
+                         ProbeReader_t *reader,
+                         ProbeFailure_t *failure,
+                         ProbePreflight_t *preflight)
+{
+    memset(preflight, 0, sizeof(*preflight));
+    printf("SvProbe: preflight_start\n");
+
+    preflight->owner_acquired =
+        FPGA_UartOwnerAcquire(pdMS_TO_TICKS(kProbeOwnerAcquireMs));
+    if (!preflight->owner_acquired) {
+        PrintPreflight(preflight);
+        return Fail(failure, reader, NULL, "state_port_owner_unavailable",
+                    NULL, 0u, 0u, 0u, esp_timer_get_time());
+    }
+
+    if (!cfg->boot_mode) {
+        preflight->pause = PauseNormalUartTasks();
+    }
+    FPGA_Rx_ResetParser();
+    ReaderReset(reader);
+    preflight->initial_drain_bytes = DrainUartRxForMs(kProbePreflightDrainMs);
+    ReaderReset(reader);
+
+    FusionV2Frame_t end;
+    if (!BuildEnd(&end) || !SendFrame(cfg, "PREFLIGHT END_SESSION", &end)) {
+        PrintPreflight(preflight);
+        return false;
+    }
+
+    const bool cleanup_ok = WaitPreflightCleanupAck(reader, preflight);
+    preflight->post_cleanup_drain_bytes =
+        DrainUartRxForMs(kProbePostCleanupDrainMs);
+    ReaderReset(reader);
+
+    if (!cleanup_ok) {
+        PrintPreflight(preflight);
+        return Fail(failure, reader, NULL, "preflight_cleanup_failed",
+                    NULL, 0u, 0u, 0u, esp_timer_get_time());
+    }
+
+    FusionV2Frame_t begin;
+    if (!BuildBeginSave(&begin) || !SendFrame(cfg, "BEGIN_SAVE", &begin)) {
+        PrintPreflight(preflight);
+        return false;
+    }
+    const int64_t t0 = esp_timer_get_time();
+    preflight->begin_save_ack =
+        ExpectCtl(cfg, reader, failure, NULL,
+                  (uint8_t)kFusionOp_AckAccepted,
+                  (uint8_t)kFusionOp_BeginSave,
+                  "BEGIN_SAVE", 0u, 0u, 0u, t0);
+    PrintPreflight(preflight);
+    return preflight->begin_save_ack;
+}
+
 static bool RunProbe(const ProbeConfig_t *cfg)
 {
     ProbeReader_t reader;
     ProbeFailure_t failure;
+    ProbePreflight_t preflight;
     ReaderReset(&reader);
     memset(&failure, 0, sizeof(failure));
+    memset(&preflight, 0, sizeof(preflight));
 
     printf("SvProbe: START mode=%s reduced_logging=%s flash_writes=no "
            "rx_driver_old=%u rx_driver_new=%u local_rx_cache=%u "
@@ -612,24 +795,7 @@ static bool RunProbe(const ProbeConfig_t *cfg)
            (unsigned)uxTaskPriorityGet(NULL),
            xPortGetCoreID());
 
-    if (!cfg->boot_mode) {
-        PauseNormalUartTasks();
-    } else {
-        uart_flush(UART_NUM_1);
-    }
-
-    bool ok = SendCtlAndExpectAck(cfg, &reader, &failure,
-                                  "END_SESSION clear",
-                                  BuildEnd,
-                                  (uint8_t)kFusionOp_EndSession,
-                                  false);
-    if (ok) {
-        ok = SendCtlAndExpectAck(cfg, &reader, &failure,
-                                 "BEGIN_SAVE",
-                                 BuildBeginSave,
-                                 (uint8_t)kFusionOp_BeginSave,
-                                 false);
-    }
+    bool ok = RunPreflight(cfg, &reader, &failure, &preflight);
     if (ok) {
         printf("SvProbe: save session active\n");
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -642,18 +808,24 @@ static bool RunProbe(const ProbeConfig_t *cfg)
         }
     }
 
-    printf("SvProbe: sending END_SESSION cleanup\n");
-    vTaskDelay(pdMS_TO_TICKS(kProbeFinalEndMs));
-    const bool cleanup_ok =
-        SendCtlAndExpectAck(cfg, &reader, &failure,
-                            "END_SESSION cleanup",
-                            BuildEnd,
-                            (uint8_t)kFusionOp_EndSession,
-                            true);
-    ok = ok && cleanup_ok;
+    bool cleanup_ok = false;
+    if (preflight.owner_acquired) {
+        printf("SvProbe: sending END_SESSION cleanup\n");
+        vTaskDelay(pdMS_TO_TICKS(kProbeFinalEndMs));
+        cleanup_ok =
+            SendCtlAndExpectAck(cfg, &reader, &failure,
+                                "END_SESSION cleanup",
+                                BuildEnd,
+                                (uint8_t)kFusionOp_EndSession,
+                                true);
+        ok = ok && cleanup_ok;
+    }
 
     if (!cfg->boot_mode) {
         ResumeNormalUartTasks();
+    }
+    if (preflight.owner_acquired) {
+        FPGA_UartOwnerRelease();
     }
 
     printf("SvProbe: RESULT %s mode=%s cleanup_ack=%s resync_non_marker=%lu "

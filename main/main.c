@@ -236,6 +236,7 @@ void app_main(void)
 {
     persist_storage_init();
     Mutex_Init();
+    FPGA_UartOwnerInit();
 
     // Set up the system management UART to/from the FPGA
     ESP_LOGI(TAG, "Initialize FPGA UART");

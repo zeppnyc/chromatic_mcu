@@ -95,7 +95,14 @@ void FPGA_RxTask(void *arg)
             portMAX_DELAY
         );
 
-        const int32_t ByteCount = uart_read_bytes(UART_NUM_1, pRxBuffer, sizeof(RxBuffer), pdMS_TO_TICKS(10));
+        int32_t ByteCount = 0;
+        if (FPGA_UartOwnerAcquire(pdMS_TO_TICKS(10))) {
+            ByteCount = uart_read_bytes(UART_NUM_1,
+                                        pRxBuffer,
+                                        sizeof(RxBuffer),
+                                        pdMS_TO_TICKS(10));
+            FPGA_UartOwnerRelease();
+        }
 
         if (ByteCount > 0)
         {
@@ -126,6 +133,13 @@ void FPGA_Rx_Resume(void)
 void FPGA_Rx_Pause(void)
 {
    (void) xEventGroupClearBits(xEventGroupHandle, kRxFlag_Resume);
+}
+
+void FPGA_Rx_ResetParser(void)
+{
+    _eState = kScanForHeaderMarker;
+    BufferIndex = 0;
+    memset(DecodeBuffer, 0x0, sizeof(DecodeBuffer));
 }
 
 void FPGA_Rx_UseBrightnessReadback(void)
