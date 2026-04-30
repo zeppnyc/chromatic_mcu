@@ -33,6 +33,8 @@ enum {
     kProbePreflightDrainMs = 60,
     kProbeCleanupAckMs = 500,
     kProbePostCleanupDrainMs = 60,
+    kProbeBoundaryDrainMs = 10,
+    kProbeBoundaryRawDrainMs = 2,
 };
 
 static const char *TAG = "SvProbe";
@@ -44,6 +46,39 @@ typedef struct {
     uint16_t length;
     bool validate;
 } ProbeRegion_t;
+
+typedef enum {
+    kProbePhase_NextRegion = 0,
+    kProbePhase_WaitingAckAccepted,
+    kProbePhase_ReadingData,
+    kProbePhase_WaitingAckDone,
+    kProbePhase_BoundaryDrain,
+} ProbePhase_t;
+
+typedef struct {
+    const char *type;
+    uint8_t addr;
+    uint8_t opcode;
+    uint16_t seq;
+    uint8_t data_len;
+    uint8_t payload_len;
+    bool valid;
+} ProbeFrameSummary_t;
+
+typedef struct {
+    const ProbeRegion_t *previous_region;
+    const ProbeRegion_t *current_region;
+    ProbePhase_t phase;
+    uint32_t boundary_drain_bytes;
+    uint32_t boundary_stale_frames;
+    uint32_t packets;
+    uint32_t bytes;
+    uint16_t expected_seq;
+    bool ack_accepted;
+    bool ack_done;
+    bool stream_done_seen;
+    ProbeFrameSummary_t last_frame;
+} ProbeRegionStats_t;
 
 typedef struct {
     uint8_t buf[kProbeRxCacheBytes];
@@ -129,6 +164,7 @@ static bool ReadDecodedFrameWithTimeout(ProbeReader_t *reader,
                                         uint32_t timeout_ms,
                                         bool print_timeout,
                                         FusionV2Decoded_t *decoded);
+static uint32_t DrainUartRxForMs(uint32_t duration_ms);
 
 static bool EnsureRxBuf(uint16_t need)
 {
@@ -178,6 +214,104 @@ static void SnapshotRuntimeStats(ProbeFailure_t *failure)
     failure->uart_buffered = buffered;
     failure->heap_free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     failure->heap_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+}
+
+static const char *PhaseName(ProbePhase_t phase)
+{
+    switch (phase) {
+        case kProbePhase_WaitingAckAccepted: return "waiting_ack_accepted";
+        case kProbePhase_ReadingData: return "reading_data";
+        case kProbePhase_WaitingAckDone: return "waiting_ack_done";
+        case kProbePhase_BoundaryDrain: return "boundary_drain";
+        case kProbePhase_NextRegion:
+        default: return "next_region";
+    }
+}
+
+static const char *FrameTypeName(const FusionV2Decoded_t *frame)
+{
+    if (frame == NULL) {
+        return "none";
+    }
+    if (frame->addr == (uint8_t)kFusionAddr_StateCtl) {
+        return "CTL";
+    }
+    if (frame->addr == (uint8_t)kFusionAddr_StateData) {
+        return "DATA";
+    }
+    return "OTHER";
+}
+
+static void CaptureFrameSummary(ProbeFrameSummary_t *summary,
+                                const FusionV2Decoded_t *frame)
+{
+    memset(summary, 0, sizeof(*summary));
+    summary->type = FrameTypeName(frame);
+    if (frame == NULL) {
+        return;
+    }
+    summary->addr = frame->addr;
+    summary->opcode = frame->ctl_opcode;
+    summary->seq = frame->data_seq;
+    summary->data_len = frame->data_len;
+    summary->payload_len = frame->payload_len;
+    summary->valid = true;
+}
+
+static void PrintRegionSummary(const ProbeRegionStats_t *stats,
+                               const char *status,
+                               int64_t elapsed_ms)
+{
+    printf("SvProbe: REGION_SUMMARY %s status=%s id=0x%02X length=%u "
+           "packets=%lu bytes=%lu elapsed_ms=%lld ack_accepted=%s "
+           "ack_done=%s boundary_stale_frames=%lu boundary_drain_bytes=%lu\n",
+           stats->current_region != NULL ? stats->current_region->name : "(none)",
+           status,
+           stats->current_region != NULL ? (unsigned)stats->current_region->region : 0u,
+           stats->current_region != NULL ? (unsigned)stats->current_region->length : 0u,
+           (unsigned long)stats->packets,
+           (unsigned long)stats->bytes,
+           (long long)elapsed_ms,
+           stats->ack_accepted ? "yes" : "no",
+           stats->ack_done ? "yes" : "no",
+           (unsigned long)stats->boundary_stale_frames,
+           (unsigned long)stats->boundary_drain_bytes);
+}
+
+static void PrintRegionFailureContext(const ProbeRegionStats_t *stats,
+                                      const char *expected_frame,
+                                      const FusionV2Decoded_t *actual,
+                                      const ProbeReader_t *reader)
+{
+    ProbeFrameSummary_t actual_summary;
+    if (actual != NULL) {
+        CaptureFrameSummary(&actual_summary, actual);
+    } else if (stats->last_frame.valid) {
+        actual_summary = stats->last_frame;
+    } else {
+        CaptureFrameSummary(&actual_summary, NULL);
+    }
+    printf("SvProbe: REGION_FAIL phase=%s expected=%s actual_type=%s "
+           "actual_addr=0x%02X actual_opcode=0x%02X actual_seq=%u "
+           "actual_data_len=%u actual_payload_len=%u expected_seq=%u "
+           "previous_region=%s current_region=%s boundary_stale_frames=%lu "
+           "boundary_drain_bytes=%lu bad_len=%lu bad_crc=%lu resync_non_marker=%lu\n",
+           PhaseName(stats->phase),
+           expected_frame,
+           actual_summary.type,
+           actual_summary.addr,
+           actual_summary.opcode,
+           (unsigned)actual_summary.seq,
+           (unsigned)actual_summary.data_len,
+           (unsigned)actual_summary.payload_len,
+           (unsigned)stats->expected_seq,
+           stats->previous_region != NULL ? stats->previous_region->name : "(none)",
+           stats->current_region != NULL ? stats->current_region->name : "(none)",
+           (unsigned long)stats->boundary_stale_frames,
+           (unsigned long)stats->boundary_drain_bytes,
+           (unsigned long)reader->bad_payload_len,
+           (unsigned long)reader->bad_crc,
+           (unsigned long)reader->skipped_non_marker);
 }
 
 static void PrintFailure(const ProbeFailure_t *f)
@@ -490,9 +624,145 @@ static void PrintBytes(const char *label, const uint8_t *data, uint16_t count)
     }
 }
 
+static bool ExpectReadStreamAckAccepted(ProbeReader_t *reader,
+                                        ProbeFailure_t *failure,
+                                        ProbeRegionStats_t *stats,
+                                        int64_t t0)
+{
+    const uint32_t bad_len0 = reader->bad_payload_len;
+    const uint32_t bad_crc0 = reader->bad_crc;
+    const int64_t deadline = esp_timer_get_time()
+                           + ((int64_t)kProbeFrameTimeoutMs * 1000);
+
+    while (esp_timer_get_time() < deadline) {
+        FusionV2Decoded_t d;
+        const int64_t now = esp_timer_get_time();
+        const uint32_t remain_ms =
+            (uint32_t)((deadline > now) ? ((deadline - now + 999) / 1000) : 0);
+        if (remain_ms == 0u ||
+            !ReadDecodedFrameWithTimeout(reader,
+                                         "READ_STREAM_BEGIN ack",
+                                         remain_ms,
+                                         true,
+                                         &d)) {
+            PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+            PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
+                                      NULL, reader);
+            return Fail(failure, reader, stats->current_region,
+                        "timeout_or_unrecoverable_resync",
+                        NULL, stats->expected_seq, stats->bytes,
+                        stats->packets, t0);
+        }
+        CaptureFrameSummary(&stats->last_frame, &d);
+
+        if (reader->bad_payload_len != bad_len0 || reader->bad_crc != bad_crc0) {
+            PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+            PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
+                                      &d, reader);
+            return Fail(failure, reader, stats->current_region,
+                        reader->bad_payload_len != bad_len0 ?
+                            "bad_len_during_ack_accepted" :
+                            "bad_crc_during_ack_accepted",
+                        &d, stats->expected_seq, stats->bytes,
+                        stats->packets, t0);
+        }
+
+        if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
+            d.ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
+            d.ack_for_opcode == (uint8_t)kFusionOp_ReadStreamBegin) {
+            stats->ack_accepted = true;
+            if (stats->boundary_stale_frames != 0u) {
+                PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+                PrintRegionFailureContext(stats, "clean ACK_ACCEPTED(ReadStreamBegin)",
+                                          &d, reader);
+                return Fail(failure, reader, stats->current_region,
+                            "stale_frame_before_ack_accepted",
+                            &d, stats->expected_seq, stats->bytes,
+                            stats->packets, t0);
+            }
+            return true;
+        }
+
+        stats->boundary_stale_frames++;
+        if (d.addr == (uint8_t)kFusionAddr_StateData ||
+            (d.addr == (uint8_t)kFusionAddr_StateCtl &&
+             d.ctl_opcode == (uint8_t)kFusionOp_AckDone)) {
+            continue;
+        }
+
+        PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+        PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
+                                  &d, reader);
+        return Fail(failure, reader, stats->current_region,
+                    "unexpected_frame_while_expecting_ack_accepted",
+                    &d, stats->expected_seq, stats->bytes, stats->packets, t0);
+    }
+
+    PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+    PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
+                              NULL, reader);
+    return Fail(failure, reader, stats->current_region,
+                "timeout_waiting_ack_accepted",
+                NULL, stats->expected_seq, stats->bytes, stats->packets, t0);
+}
+
+static bool DrainRegionBoundary(ProbeReader_t *reader,
+                                ProbeFailure_t *failure,
+                                ProbeRegionStats_t *stats,
+                                int64_t t0)
+{
+    stats->phase = kProbePhase_BoundaryDrain;
+    const uint32_t bad_len0 = reader->bad_payload_len;
+    const uint32_t bad_crc0 = reader->bad_crc;
+    const int64_t deadline = esp_timer_get_time()
+                           + ((int64_t)kProbeBoundaryDrainMs * 1000);
+
+    while (esp_timer_get_time() < deadline) {
+        FusionV2Decoded_t d;
+        const int64_t now = esp_timer_get_time();
+        const uint32_t remain_ms =
+            (uint32_t)((deadline > now) ? ((deadline - now + 999) / 1000) : 0);
+        if (remain_ms == 0u ||
+            !ReadDecodedFrameWithTimeout(reader,
+                                         "boundary_drain",
+                                         remain_ms,
+                                         false,
+                                         &d)) {
+            break;
+        }
+
+        CaptureFrameSummary(&stats->last_frame, &d);
+        stats->boundary_stale_frames++;
+        stats->boundary_drain_bytes += (uint32_t)d.payload_len + 4u;
+    }
+
+    if (reader->bad_payload_len != bad_len0 || reader->bad_crc != bad_crc0 ||
+        stats->boundary_stale_frames != 0u) {
+        stats->boundary_drain_bytes += DrainUartRxForMs(kProbeBoundaryRawDrainMs);
+        PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+        PrintRegionFailureContext(stats, "quiet boundary before next region",
+                                  NULL, reader);
+        const bool failed = Fail(failure, reader, stats->current_region,
+                    stats->boundary_stale_frames != 0u ?
+                        "boundary_stale_frame" :
+                        (reader->bad_payload_len != bad_len0 ?
+                            "bad_len_during_boundary_drain" :
+                            "bad_crc_during_boundary_drain"),
+                    NULL, stats->expected_seq, stats->bytes,
+                    stats->packets, t0);
+        ReaderReset(reader);
+        return failed;
+    }
+
+    stats->boundary_drain_bytes += DrainUartRxForMs(kProbeBoundaryRawDrainMs);
+    ReaderReset(reader);
+    return true;
+}
+
 static bool ReadRegion(const ProbeConfig_t *cfg,
                        ProbeReader_t *reader,
                        ProbeFailure_t *failure,
+                       const ProbeRegion_t *previous_region,
                        const ProbeRegion_t *region)
 {
     if (!EnsureRxBuf(region->length)) {
@@ -505,6 +775,11 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
     uint32_t packets = 0u;
     uint16_t expected_seq = 0u;
     const int64_t t0 = esp_timer_get_time();
+    ProbeRegionStats_t stats = {
+        .previous_region = previous_region,
+        .current_region = region,
+        .phase = kProbePhase_NextRegion,
+    };
 
     FusionV2Frame_t begin;
     if (!FusionSavestate_BuildReadStreamBegin(region->region, 0u,
@@ -518,36 +793,60 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
     if (!SendFrame(cfg, "READ_STREAM_BEGIN", &begin)) {
         return false;
     }
-    if (!ExpectCtl(cfg, reader, failure, region,
-                   (uint8_t)kFusionOp_AckAccepted,
-                   (uint8_t)kFusionOp_ReadStreamBegin,
-                   "READ_STREAM_BEGIN ack",
-                   expected_seq, received, packets, t0)) {
+    stats.phase = kProbePhase_WaitingAckAccepted;
+    if (!ExpectReadStreamAckAccepted(reader, failure, &stats, t0)) {
         return false;
     }
 
+    stats.phase = kProbePhase_ReadingData;
     while (received < region->length) {
         FusionV2Decoded_t d;
         if (!ReadDecodedFrame(reader, region->name, &d)) {
+            stats.expected_seq = expected_seq;
+            stats.bytes = received;
+            stats.packets = packets;
+            PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+            PrintRegionFailureContext(&stats, "STATE_DATA", NULL, reader);
             return Fail(failure, reader, region,
                         "timeout_or_unrecoverable_resync",
                         NULL, expected_seq, received, packets, t0);
         }
+        CaptureFrameSummary(&stats.last_frame, &d);
         if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
             d.ctl_opcode == (uint8_t)kFusionOp_Error) {
+            stats.expected_seq = expected_seq;
+            stats.bytes = received;
+            stats.packets = packets;
+            PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+            PrintRegionFailureContext(&stats, "STATE_DATA", &d, reader);
             return Fail(failure, reader, region, "FPGA_ERROR",
                         &d, expected_seq, received, packets, t0);
         }
         if (d.addr != (uint8_t)kFusionAddr_StateData) {
+            stats.expected_seq = expected_seq;
+            stats.bytes = received;
+            stats.packets = packets;
+            PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+            PrintRegionFailureContext(&stats, "STATE_DATA", &d, reader);
             return Fail(failure, reader, region, "unexpected_frame_in_stream",
                         &d, expected_seq, received, packets, t0);
         }
         if (d.data_seq != expected_seq) {
+            stats.expected_seq = expected_seq;
+            stats.bytes = received;
+            stats.packets = packets;
+            PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+            PrintRegionFailureContext(&stats, "STATE_DATA seq", &d, reader);
             return Fail(failure, reader, region, "seq_mismatch",
                         &d, expected_seq, received, packets, t0);
         }
         if (d.data_len == 0u ||
             (uint32_t)d.data_len > ((uint32_t)region->length - received)) {
+            stats.expected_seq = expected_seq;
+            stats.bytes = received;
+            stats.packets = packets;
+            PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+            PrintRegionFailureContext(&stats, "STATE_DATA len", &d, reader);
             return Fail(failure, reader, region, "bad_data_len",
                         &d, expected_seq, received, packets, t0);
         }
@@ -556,23 +855,48 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
         received += d.data_len;
         packets++;
         expected_seq++;
+        stats.bytes = received;
+        stats.packets = packets;
+        stats.expected_seq = expected_seq;
     }
+    stats.stream_done_seen = true;
 
-    if (!ExpectCtl(cfg, reader, failure, region,
-                   (uint8_t)kFusionOp_AckDone,
-                   (uint8_t)kFusionOp_ReadStreamBegin,
-                   "READ_STREAM_BEGIN done",
-                   expected_seq, received, packets, t0)) {
-        return false;
+    stats.phase = kProbePhase_WaitingAckDone;
+    FusionV2Decoded_t done;
+    if (!ReadDecodedFrame(reader, "READ_STREAM_BEGIN done", &done)) {
+        PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+        PrintRegionFailureContext(&stats, "ACK_DONE(ReadStreamBegin)", NULL, reader);
+        return Fail(failure, reader, region, "timeout_or_unrecoverable_resync",
+                    NULL, expected_seq, received, packets, t0);
     }
+    CaptureFrameSummary(&stats.last_frame, &done);
+    if (done.addr != (uint8_t)kFusionAddr_StateCtl ||
+        done.ctl_opcode != (uint8_t)kFusionOp_AckDone ||
+        done.ack_for_opcode != (uint8_t)kFusionOp_ReadStreamBegin) {
+        PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+        PrintRegionFailureContext(&stats, "ACK_DONE(ReadStreamBegin)", &done, reader);
+        return Fail(failure, reader, region,
+                    done.addr == (uint8_t)kFusionAddr_StateData ?
+                        "stale_DATA_while_expecting_ACK_DONE" :
+                        "unexpected_frame_while_expecting_ACK_DONE",
+                    &done, expected_seq, received, packets, t0);
+    }
+    stats.ack_done = true;
 
     if (region->validate && !ValidateRegionLight(region, data, region->length)) {
+        PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
+        PrintRegionFailureContext(&stats, "region validation", NULL, reader);
         return Fail(failure, reader, region, "region_validation_failed",
                     NULL, expected_seq, received, packets, t0);
     }
 
+    if (!DrainRegionBoundary(reader, failure, &stats, t0)) {
+        return false;
+    }
+
     const int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
     const uint32_t crc = FusionSavestate_Crc32(data, region->length);
+    PrintRegionSummary(&stats, "PASS", elapsed_ms);
     printf("SvProbe: REGION %s PASS id=0x%02X packets=%lu bytes=%lu "
            "dt_ms=%lld crc32=%08lX",
            region->name,
@@ -802,7 +1126,8 @@ static bool RunProbe(const ProbeConfig_t *cfg)
     }
 
     for (size_t i = 0; ok && i < kProbeRegionCount; ++i) {
-        ok = ReadRegion(cfg, &reader, &failure, &kRegions[i]);
+        const ProbeRegion_t *previous = (i == 0u) ? NULL : &kRegions[i - 1u];
+        ok = ReadRegion(cfg, &reader, &failure, previous, &kRegions[i]);
         if (ok) {
             vTaskDelay(pdMS_TO_TICKS(kProbeInterRegionMs));
         }
