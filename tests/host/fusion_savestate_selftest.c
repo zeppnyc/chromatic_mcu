@@ -399,7 +399,7 @@ static void test_game_id_v1_deterministic(void)
 static void test_storage_header_layout(void)
 {
     fprintf(stderr, "[test] FusionStateHeader / RegionDirectory size and field sanity\n");
-    EXPECT_EQ_U(sizeof(FusionStateHeader_t), 56u);
+    EXPECT_EQ_U(sizeof(FusionStateHeader_t), 64u);
     EXPECT_EQ_U(sizeof(FusionRegionDirectory_t), 16u);
     /* Magic must round-trip as 'F','U','S','S' little-endian. */
     EXPECT_EQ_U(FUSION_SAVESTATE_MAGIC, 0x53535546u);
@@ -439,6 +439,8 @@ static void test_storage_two_phase_commit(void)
     memcpy(hdr.fpga_version, "abcdef12", 8);
     memcpy(hdr.mcu_version,  "12345678", 8);
     hdr.commit_generation = 42u;
+    hdr.region_bitmap = 0x00000200u;
+    memcpy(hdr.savestate_tag, "P470", 4);
     EXPECT_EQ_U(FusionStorage_StageHeader(&s, &hdr, &dir, 1u), kFusionStorage_Ok);
 
     /* Before commit, no slot is "newest valid". */

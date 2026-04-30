@@ -11,14 +11,8 @@
  * and the two-phase commit API shape required by the architecture
  * doc.
  *
- * Phase 1 ships:
- *   - The struct layout (above, in fusion_savestate.h).
- *   - A clean API surface for slot lifecycle.
- *   - A pure in-memory mock backend used by host self-tests.
- *
- * Real ESP-IDF custom partition integration is deferred to Phase 1.5
- * /Phase 5; the API shape here is what that integration will fill in.
- * No partition table is added in this commit.
+ * Provides a pure in-memory mock backend for host self-tests and an
+ * ESP-IDF custom data-partition backend for MCU persistence smoke tests.
  */
 
 #ifdef __cplusplus
@@ -29,7 +23,7 @@ typedef enum {
     kFusionStorage_Ok = 0,
     kFusionStorage_BadArg,
     kFusionStorage_NotInitialized,
-    kFusionStorage_NotImplemented,    /* real-flash backend not yet wired */
+    kFusionStorage_NotImplemented,    /* requested partition/backend not found */
     kFusionStorage_OutOfSpace,
     kFusionStorage_NoActiveSlot,
     kFusionStorage_NoValidSlot,
@@ -41,7 +35,7 @@ typedef enum {
 typedef enum {
     kFusionStorageBackend_None = 0,
     kFusionStorageBackend_Mock,       /* in-RAM, used by host tests */
-    kFusionStorageBackend_Partition,  /* ESP-IDF custom data partition (deferred) */
+    kFusionStorageBackend_Partition,  /* ESP-IDF custom data partition */
 } FusionStorageBackendKind_t;
 
 typedef struct {
@@ -57,11 +51,15 @@ typedef struct {
     FusionStorageBackendKind_t kind;
     uint8_t  *mock_backing;           /* mock backend only; otherwise NULL */
     uint32_t  mock_size;
+    const void *partition;            /* ESP-IDF esp_partition_t*, partition backend only */
 
     uint32_t  slot_count;
     uint32_t  slot_size;
 
     FusionStorageSlot_t *slots;       /* length == slot_count */
+    FusionStorageSlot_t  partition_slot;
+    FusionStateHeader_t  staged_header;
+    bool                 has_staged_header;
     int32_t   active_slot;            /* slot being staged, -1 if none */
     bool      initialized;
 } FusionStorage_t;
@@ -80,9 +78,8 @@ FusionStorageResult_t FusionStorage_InitMock(FusionStorage_t *s,
                                              uint32_t backing_size);
 
 /*
- * Real-partition init shape — wired up in Phase 1.5/5. Always returns
- * kFusionStorage_NotImplemented in Phase 1 so callers can fall back to
- * the mock without conditional compilation.
+ * Initialize an ESP-IDF custom data partition backend. Non-ESP host builds
+ * return kFusionStorage_NotImplemented.
  */
 FusionStorageResult_t FusionStorage_InitFromPartition(FusionStorage_t *s,
                                                       const char *partition_label);
@@ -130,6 +127,13 @@ FusionStorageResult_t FusionStorage_FindNewestValidSlot(FusionStorage_t *s,
 FusionStorageResult_t FusionStorage_ReadSlotHeader(FusionStorage_t *s,
                                                    uint32_t slot_index,
                                                    FusionStateHeader_t *header_out);
+
+/* Read bytes from a committed slot, with offset relative to the slot start. */
+FusionStorageResult_t FusionStorage_ReadSlotBytes(FusionStorage_t *s,
+                                                  uint32_t slot_index,
+                                                  uint32_t offset,
+                                                  uint8_t *data,
+                                                  uint32_t length);
 
 #ifdef __cplusplus
 }

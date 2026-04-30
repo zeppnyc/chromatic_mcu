@@ -124,6 +124,8 @@ typedef struct __attribute__((packed)) {
     char     mcu_version[FUSION_VERSION_FIELD_LEN];  /* git short hash, NUL-padded */
     uint32_t region_table_offset;    /* relative to start of slot */
     uint32_t region_count;
+    uint32_t region_bitmap;          /* capability bitmap captured from region 0 header */
+    char     savestate_tag[4];       /* capability tag captured from region 0 header */
     uint32_t payload_crc32;          /* CRC32 over payload + region table */
     uint32_t commit_generation;      /* monotonic per write */
     uint8_t  commit_state;           /* FusionCommitState_t */

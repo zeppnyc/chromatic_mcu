@@ -22,6 +22,8 @@
 #include "fpga_rx.h"
 #include "fpga_tx.h"
 #include "frameblend.h"
+#include "fusion_savestate_smoke48a.h"
+#include "fusion_savestate_transport_probe.h"
 #include "fw.h"
 #include "osd.h"
 #include "osd_default.h"
@@ -247,6 +249,13 @@ void app_main(void)
     gpio_sleep_set_direction(PIN_NUM_UART_FROM_FPGA, GPIO_MODE_INPUT);
     gpio_sleep_set_pull_mode(PIN_NUM_UART_FROM_FPGA, GPIO_PULLUP_ONLY);
 
+#if defined(FUSION_TRANSPORT_PROBE_BOOT_AUTO)
+    FusionSavestateTransportProbe_RunBootProbeOnce();
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
+
     // Task is created earlier than the others to apply the settings ASAP
     xTaskCreate(FPGA_TxTask, "fpga_tx_task", kFPGATxTask_StackDepth, NULL, kFPGATxTask_Priority, FPGA_GetTxTaskHandle());
 
@@ -344,6 +353,8 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&ReplHWConfig, &ReplConfig, &pRepl));
     esp_console_register_help_command();
+    FusionSavestateSmoke48a_RegisterCommands();
+    FusionSavestateTransportProbe_RegisterCommands();
     // All commands must be registered prior to starting the REPL
     ESP_ERROR_CHECK(esp_console_start_repl(pRepl));
 
