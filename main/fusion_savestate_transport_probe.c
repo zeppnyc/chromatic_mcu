@@ -35,6 +35,8 @@ enum {
     kProbePostCleanupDrainMs = 60,
     kProbeBoundaryDrainMs = 10,
     kProbeBoundaryRawDrainMs = 2,
+    kProbeWramChunkBytes = 512,
+    kProbeWramChunkGapMs = 50,
 };
 
 static const char *TAG = "SvProbe";
@@ -73,7 +75,10 @@ typedef struct {
     uint32_t boundary_stale_frames;
     uint32_t packets;
     uint32_t bytes;
+    uint16_t request_offset;
+    uint16_t request_length;
     uint16_t expected_seq;
+    int chunk_index;
     bool ack_accepted;
     bool ack_done;
     bool stream_done_seen;
@@ -262,13 +267,15 @@ static void PrintRegionSummary(const ProbeRegionStats_t *stats,
                                const char *status,
                                int64_t elapsed_ms)
 {
-    printf("SvProbe: REGION_SUMMARY %s status=%s id=0x%02X length=%u "
-           "packets=%lu bytes=%lu elapsed_ms=%lld ack_accepted=%s "
+    printf("SvProbe: REGION_SUMMARY %s status=%s id=0x%02X offset=%u length=%u "
+           "chunk=%d packets=%lu bytes=%lu elapsed_ms=%lld ack_accepted=%s "
            "ack_done=%s boundary_stale_frames=%lu boundary_drain_bytes=%lu\n",
            stats->current_region != NULL ? stats->current_region->name : "(none)",
            status,
            stats->current_region != NULL ? (unsigned)stats->current_region->region : 0u,
-           stats->current_region != NULL ? (unsigned)stats->current_region->length : 0u,
+           (unsigned)stats->request_offset,
+           (unsigned)stats->request_length,
+           stats->chunk_index,
            (unsigned long)stats->packets,
            (unsigned long)stats->bytes,
            (long long)elapsed_ms,
@@ -276,6 +283,26 @@ static void PrintRegionSummary(const ProbeRegionStats_t *stats,
            stats->ack_done ? "yes" : "no",
            (unsigned long)stats->boundary_stale_frames,
            (unsigned long)stats->boundary_drain_bytes);
+}
+
+static void PrintWramChunkSummary(const ProbeRegionStats_t *stats,
+                                  const char *status,
+                                  int64_t elapsed_ms,
+                                  uint32_t gap_drain_bytes)
+{
+    printf("SvProbe: WRAM_CHUNK index=%d offset=%u length=%u status=%s "
+           "packets=%lu bytes=%lu elapsed_ms=%lld ack_accepted=%s "
+           "ack_done=%s gap_drain_bytes=%lu\n",
+           stats->chunk_index,
+           (unsigned)stats->request_offset,
+           (unsigned)stats->request_length,
+           status,
+           (unsigned long)stats->packets,
+           (unsigned long)stats->bytes,
+           (long long)elapsed_ms,
+           stats->ack_accepted ? "yes" : "no",
+           stats->ack_done ? "yes" : "no",
+           (unsigned long)gap_drain_bytes);
 }
 
 static void PrintRegionFailureContext(const ProbeRegionStats_t *stats,
@@ -759,18 +786,16 @@ static bool DrainRegionBoundary(ProbeReader_t *reader,
     return true;
 }
 
-static bool ReadRegion(const ProbeConfig_t *cfg,
-                       ProbeReader_t *reader,
-                       ProbeFailure_t *failure,
-                       const ProbeRegion_t *previous_region,
-                       const ProbeRegion_t *region)
+static bool ReadRegionRange(const ProbeConfig_t *cfg,
+                            ProbeReader_t *reader,
+                            ProbeFailure_t *failure,
+                            const ProbeRegion_t *previous_region,
+                            const ProbeRegion_t *region,
+                            uint16_t offset,
+                            uint16_t length,
+                            int chunk_index,
+                            uint8_t *data)
 {
-    if (!EnsureRxBuf(region->length)) {
-        return false;
-    }
-    uint8_t *data = s_rx_buf;
-    memset(data, 0, region->length);
-
     uint32_t received = 0u;
     uint32_t packets = 0u;
     uint16_t expected_seq = 0u;
@@ -779,17 +804,24 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
         .previous_region = previous_region,
         .current_region = region,
         .phase = kProbePhase_NextRegion,
+        .request_offset = offset,
+        .request_length = length,
+        .chunk_index = chunk_index,
     };
 
     FusionV2Frame_t begin;
-    if (!FusionSavestate_BuildReadStreamBegin(region->region, 0u,
-                                              region->length, &begin)) {
+    if (!FusionSavestate_BuildReadStreamBegin(region->region, offset,
+                                              length, &begin)) {
         printf("SvProbe: build READ_STREAM_BEGIN %s failed\n", region->name);
         return false;
     }
 
-    printf("SvProbe: BEGIN region=%s id=0x%02X length=%u\n",
-           region->name, (unsigned)region->region, (unsigned)region->length);
+    printf("SvProbe: BEGIN region=%s id=0x%02X offset=%u length=%u chunk=%d\n",
+           region->name,
+           (unsigned)region->region,
+           (unsigned)offset,
+           (unsigned)length,
+           chunk_index);
     if (!SendFrame(cfg, "READ_STREAM_BEGIN", &begin)) {
         return false;
     }
@@ -799,7 +831,7 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
     }
 
     stats.phase = kProbePhase_ReadingData;
-    while (received < region->length) {
+    while (received < length) {
         FusionV2Decoded_t d;
         if (!ReadDecodedFrame(reader, region->name, &d)) {
             stats.expected_seq = expected_seq;
@@ -841,7 +873,7 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
                         &d, expected_seq, received, packets, t0);
         }
         if (d.data_len == 0u ||
-            (uint32_t)d.data_len > ((uint32_t)region->length - received)) {
+            (uint32_t)d.data_len > ((uint32_t)length - received)) {
             stats.expected_seq = expected_seq;
             stats.bytes = received;
             stats.packets = packets;
@@ -883,7 +915,8 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
     }
     stats.ack_done = true;
 
-    if (region->validate && !ValidateRegionLight(region, data, region->length)) {
+    if (region->validate && offset == 0u && length == region->length &&
+        !ValidateRegionLight(region, data, length)) {
         PrintRegionSummary(&stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
         PrintRegionFailureContext(&stats, "region validation", NULL, reader);
         return Fail(failure, reader, region, "region_validation_failed",
@@ -895,25 +928,98 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
     }
 
     const int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
-    const uint32_t crc = FusionSavestate_Crc32(data, region->length);
+    const uint32_t crc = FusionSavestate_Crc32(data, length);
     PrintRegionSummary(&stats, "PASS", elapsed_ms);
     printf("SvProbe: REGION %s PASS id=0x%02X packets=%lu bytes=%lu "
-           "dt_ms=%lld crc32=%08lX",
+           "dt_ms=%lld offset=%u length=%u crc32=%08lX",
            region->name,
            (unsigned)region->region,
            (unsigned long)packets,
            (unsigned long)received,
            (long long)elapsed_ms,
+           (unsigned)offset,
+           (unsigned)length,
            (unsigned long)crc);
     if (!cfg->reduced_logging) {
-        const uint16_t first = region->length < 16u ? region->length : 16u;
+        const uint16_t first = length < 16u ? length : 16u;
         PrintBytes("first", data, first);
-        if (region->length > 32u) {
-            PrintBytes("last", &data[region->length - 16u], 16u);
+        if (length > 32u) {
+            PrintBytes("last", &data[length - 16u], 16u);
         }
     }
     printf("\n");
+    if (chunk_index >= 0) {
+        vTaskDelay(pdMS_TO_TICKS(kProbeWramChunkGapMs));
+        const uint32_t gap_drain_bytes = DrainUartRxForMs(kProbeBoundaryRawDrainMs);
+        ReaderReset(reader);
+        PrintWramChunkSummary(&stats, "PASS", elapsed_ms, gap_drain_bytes);
+    }
     return true;
+}
+
+static bool ReadRegion(const ProbeConfig_t *cfg,
+                       ProbeReader_t *reader,
+                       ProbeFailure_t *failure,
+                       const ProbeRegion_t *previous_region,
+                       const ProbeRegion_t *region)
+{
+    if (!EnsureRxBuf(region->length)) {
+        return false;
+    }
+    uint8_t *data = s_rx_buf;
+    memset(data, 0, region->length);
+    return ReadRegionRange(cfg, reader, failure, previous_region, region,
+                           0u, region->length, -1, data);
+}
+
+static bool ReadWramChunked(const ProbeConfig_t *cfg,
+                            ProbeReader_t *reader,
+                            ProbeFailure_t *failure,
+                            const ProbeRegion_t *previous_region,
+                            const ProbeRegion_t *region)
+{
+    if (!EnsureRxBuf(region->length)) {
+        return false;
+    }
+    uint8_t *data = s_rx_buf;
+    memset(data, 0, region->length);
+
+    uint32_t total = 0u;
+    const uint16_t chunk_count = region->length / kProbeWramChunkBytes;
+    printf("SvProbe: WRAM_CHUNKED size=%u gap_ms=%u chunks=%u total=%u\n",
+           (unsigned)kProbeWramChunkBytes,
+           (unsigned)kProbeWramChunkGapMs,
+           (unsigned)chunk_count,
+           (unsigned)region->length);
+
+    for (uint16_t i = 0u; i < chunk_count; ++i) {
+        const uint16_t offset = (uint16_t)(i * kProbeWramChunkBytes);
+        const ProbeRegion_t *prev = (i == 0u) ? previous_region : region;
+        if (!ReadRegionRange(cfg,
+                             reader,
+                             failure,
+                             prev,
+                             region,
+                             offset,
+                             (uint16_t)kProbeWramChunkBytes,
+                             (int)i,
+                             &data[offset])) {
+            printf("SvProbe: WRAM_CHUNKED FAIL chunks_passed=%u chunks_failed=1 "
+                   "total_bytes=%lu\n",
+                   (unsigned)i,
+                   (unsigned long)total);
+            return false;
+        }
+        total += kProbeWramChunkBytes;
+    }
+
+    const uint32_t crc = FusionSavestate_Crc32(data, region->length);
+    printf("SvProbe: WRAM_CHUNKED PASS chunks_passed=%u chunks_failed=0 "
+           "total_bytes=%lu crc32=%08lX\n",
+           (unsigned)chunk_count,
+           (unsigned long)total,
+           (unsigned long)crc);
+    return total == region->length;
 }
 
 static ProbePauseState_t PauseNormalUartTasks(void)
@@ -1127,7 +1233,11 @@ static bool RunProbe(const ProbeConfig_t *cfg)
 
     for (size_t i = 0; ok && i < kProbeRegionCount; ++i) {
         const ProbeRegion_t *previous = (i == 0u) ? NULL : &kRegions[i - 1u];
-        ok = ReadRegion(cfg, &reader, &failure, previous, &kRegions[i]);
+        if (kRegions[i].region == 0x0Cu) {
+            ok = ReadWramChunked(cfg, &reader, &failure, previous, &kRegions[i]);
+        } else {
+            ok = ReadRegion(cfg, &reader, &failure, previous, &kRegions[i]);
+        }
         if (ok) {
             vTaskDelay(pdMS_TO_TICKS(kProbeInterRegionMs));
         }
