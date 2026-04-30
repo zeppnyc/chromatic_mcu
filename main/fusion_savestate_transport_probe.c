@@ -10,6 +10,7 @@
 #include "fpga_rx.h"
 #include "fpga_tx.h"
 #include "fusion_savestate.h"
+#include "pwrmgr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -36,7 +37,8 @@ enum {
     kProbePostCleanupDrainMs = 60,
     kProbeBoundaryDrainMs = 10,
     kProbeBoundaryRawDrainMs = 2,
-    kProbeReadWindowPackets = 16,
+    kProbeReadWindowPackets = 65535,
+    kProbeReadWindowGapMs = 50,
     kProbeWramChunkBytes = 0,
     kProbeWramChunkGapMs = 50,
 };
@@ -92,6 +94,8 @@ typedef struct {
     uint8_t buf[kProbeRxCacheBytes];
     size_t pos;
     size_t len;
+    bool pushed_valid;
+    FusionV2Decoded_t pushed;
     uint32_t skipped_non_marker;
     uint32_t bad_payload_len;
     uint32_t bad_crc;
@@ -102,6 +106,7 @@ typedef struct {
     bool reduced_logging;
     bool boot_mode;
     bool capture_task;
+    bool wram_read_next;
     uint16_t wram_chunk_bytes;
     uint32_t wram_chunk_gap_ms;
 } ProbeConfig_t;
@@ -128,6 +133,7 @@ typedef struct {
 typedef struct {
     ProbeConfig_t cfg;
     TaskHandle_t caller;
+    uint8_t repeat_count;
     bool ok;
 } ProbeTaskRequest_t;
 
@@ -194,6 +200,12 @@ static bool EnsureRxBuf(uint16_t need)
 static void ReaderReset(ProbeReader_t *reader)
 {
     memset(reader, 0, sizeof(*reader));
+}
+
+static void ReaderPushFrame(ProbeReader_t *reader, const FusionV2Decoded_t *frame)
+{
+    reader->pushed = *frame;
+    reader->pushed_valid = true;
 }
 
 static bool ReaderByte(ProbeReader_t *reader, uint8_t *out, int64_t deadline_us)
@@ -436,6 +448,12 @@ static bool ReadDecodedFrameWithTimeout(ProbeReader_t *reader,
                                         bool print_timeout,
                                         FusionV2Decoded_t *decoded)
 {
+    if (reader->pushed_valid) {
+        *decoded = reader->pushed;
+        reader->pushed_valid = false;
+        return true;
+    }
+
     uint8_t raw[FUSION_V2_MAX_FRAME] = {0};
     const int64_t deadline = esp_timer_get_time()
                            + ((int64_t)timeout_ms * 1000);
@@ -617,8 +635,8 @@ static bool ValidateHeader(const uint8_t *data)
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P48P", 4u) != 0) {
-        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48P'\n",
+    if (memcmp(&data[12], "P48G", 4u) != 0) {
+        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48G'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }
@@ -658,13 +676,13 @@ static void PrintBytes(const char *label, const uint8_t *data, uint16_t count)
     }
 }
 
-static bool ExpectReadStreamAckAccepted(ProbeReader_t *reader,
-                                        ProbeFailure_t *failure,
-                                        ProbeRegionStats_t *stats,
-                                        int64_t t0)
+static bool ExpectStreamAckOrFirstData(ProbeReader_t *reader,
+                                       ProbeFailure_t *failure,
+                                       ProbeRegionStats_t *stats,
+                                       uint8_t ack_for,
+                                       const char *context,
+                                       int64_t t0)
 {
-    const uint32_t bad_len0 = reader->bad_payload_len;
-    const uint32_t bad_crc0 = reader->bad_crc;
     const int64_t deadline = esp_timer_get_time()
                            + ((int64_t)kProbeFrameTimeoutMs * 1000);
 
@@ -675,13 +693,12 @@ static bool ExpectReadStreamAckAccepted(ProbeReader_t *reader,
             (uint32_t)((deadline > now) ? ((deadline - now + 999) / 1000) : 0);
         if (remain_ms == 0u ||
             !ReadDecodedFrameWithTimeout(reader,
-                                         "READ_STREAM_BEGIN ack",
+                                         context,
                                          remain_ms,
                                          true,
                                          &d)) {
             PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
-            PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
-                                      NULL, reader);
+            PrintRegionFailureContext(stats, context, NULL, reader);
             return Fail(failure, reader, stats->current_region,
                         "timeout_or_unrecoverable_resync",
                         NULL, stats->expected_seq, stats->bytes,
@@ -689,31 +706,17 @@ static bool ExpectReadStreamAckAccepted(ProbeReader_t *reader,
         }
         CaptureFrameSummary(&stats->last_frame, &d);
 
-        if (reader->bad_payload_len != bad_len0 || reader->bad_crc != bad_crc0) {
-            PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
-            PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
-                                      &d, reader);
-            return Fail(failure, reader, stats->current_region,
-                        reader->bad_payload_len != bad_len0 ?
-                            "bad_len_during_ack_accepted" :
-                            "bad_crc_during_ack_accepted",
-                        &d, stats->expected_seq, stats->bytes,
-                        stats->packets, t0);
-        }
-
         if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
             d.ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
-            d.ack_for_opcode == (uint8_t)kFusionOp_ReadStreamBegin) {
+            d.ack_for_opcode == ack_for) {
             stats->ack_accepted = true;
-            if (stats->boundary_stale_frames != 0u) {
-                PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
-                PrintRegionFailureContext(stats, "clean ACK_ACCEPTED(ReadStreamBegin)",
-                                          &d, reader);
-                return Fail(failure, reader, stats->current_region,
-                            "stale_frame_before_ack_accepted",
-                            &d, stats->expected_seq, stats->bytes,
-                            stats->packets, t0);
-            }
+            return true;
+        }
+
+        if (d.addr == (uint8_t)kFusionAddr_StateData &&
+            d.data_seq == stats->expected_seq) {
+            stats->ack_accepted = true;
+            ReaderPushFrame(reader, &d);
             return true;
         }
 
@@ -725,16 +728,14 @@ static bool ExpectReadStreamAckAccepted(ProbeReader_t *reader,
         }
 
         PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
-        PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
-                                  &d, reader);
+        PrintRegionFailureContext(stats, context, &d, reader);
         return Fail(failure, reader, stats->current_region,
                     "unexpected_frame_while_expecting_ack_accepted",
                     &d, stats->expected_seq, stats->bytes, stats->packets, t0);
     }
 
     PrintRegionSummary(stats, "FAIL", (esp_timer_get_time() - t0) / 1000);
-    PrintRegionFailureContext(stats, "ACK_ACCEPTED(ReadStreamBegin)",
-                              NULL, reader);
+    PrintRegionFailureContext(stats, context, NULL, reader);
     return Fail(failure, reader, stats->current_region,
                 "timeout_waiting_ack_accepted",
                 NULL, stats->expected_seq, stats->bytes, stats->packets, t0);
@@ -834,7 +835,10 @@ static bool ReadRegionRange(const ProbeConfig_t *cfg,
         return false;
     }
     stats.phase = kProbePhase_WaitingAckAccepted;
-    if (!ExpectReadStreamAckAccepted(reader, failure, &stats, t0)) {
+    if (!ExpectStreamAckOrFirstData(reader, failure, &stats,
+                                    (uint8_t)kFusionOp_ReadStreamBegin,
+                                    "ACK_ACCEPTED(ReadStreamBegin)",
+                                    t0)) {
         return false;
     }
 
@@ -911,6 +915,7 @@ static bool ReadRegionRange(const ProbeConfig_t *cfg,
                             "build_READ_STREAM_CONTINUE_failed",
                             NULL, expected_seq, received, packets, t0);
             }
+            vTaskDelay(pdMS_TO_TICKS(kProbeReadWindowGapMs));
             if (!SendFrame(cfg, "READ_STREAM_CONTINUE", &cont)) {
                 PrintRegionSummary(&stats, "FAIL",
                                    (esp_timer_get_time() - t0) / 1000);
@@ -920,6 +925,14 @@ static bool ReadRegionRange(const ProbeConfig_t *cfg,
                             "tx_READ_STREAM_CONTINUE_failed",
                             NULL, expected_seq, received, packets, t0);
             }
+            stats.phase = kProbePhase_WaitingAckAccepted;
+            if (!ExpectStreamAckOrFirstData(reader, failure, &stats,
+                                            (uint8_t)kFusionOp_ReadStreamContinue,
+                                            "ACK_ACCEPTED(ReadStreamContinue)",
+                                            t0)) {
+                return false;
+            }
+            stats.phase = kProbePhase_ReadingData;
             stats.continue_count++;
             window_packets = 0u;
         }
@@ -1003,6 +1016,83 @@ static bool ReadRegion(const ProbeConfig_t *cfg,
     memset(data, 0, region->length);
     return ReadRegionRange(cfg, reader, failure, previous_region, region,
                            0u, region->length, -1, data);
+}
+
+static bool ReadWramReadNext(const ProbeConfig_t *cfg,
+                             ProbeReader_t *reader,
+                             ProbeFailure_t *failure,
+                             const ProbeRegion_t *previous_region,
+                             const ProbeRegion_t *region)
+{
+    if (!EnsureRxBuf(region->length)) {
+        return false;
+    }
+    uint8_t *data = s_rx_buf;
+    memset(data, 0, region->length);
+
+    printf("SvProbe: WRAM_READNEXT count=8 gap_ms=%u total=%u\n",
+           (unsigned)cfg->wram_chunk_gap_ms,
+           (unsigned)region->length);
+
+    FusionV2Frame_t seek;
+    const int64_t t0 = esp_timer_get_time();
+    if (!FusionSavestate_BuildSeek(region->region, 0u, &seek) ||
+        !SendFrame(cfg, "SEEK WRAM", &seek)) {
+        return false;
+    }
+    if (!ExpectCtl(cfg, reader, failure, region,
+                   (uint8_t)kFusionOp_AckAccepted,
+                   (uint8_t)kFusionOp_Seek,
+                   "SEEK WRAM ack", 0u, 0u, 0u, t0)) {
+        return false;
+    }
+
+    uint32_t received = 0u;
+    uint32_t packets = 0u;
+    while (received < region->length) {
+        const uint8_t count =
+            ((region->length - received) >= 8u) ? 8u
+                                                : (uint8_t)(region->length - received);
+        FusionV2Frame_t next;
+        if (!FusionSavestate_BuildReadNext(count, &next) ||
+            !SendFrame(cfg, "READ_NEXT WRAM", &next)) {
+            return false;
+        }
+
+        FusionV2Decoded_t d;
+        if (!ReadDecodedFrame(reader, "READ_NEXT WRAM", &d)) {
+            return Fail(failure, reader, region,
+                        "timeout_READ_NEXT_DATA",
+                        NULL, 0u, received, packets, t0);
+        }
+        if (d.addr != (uint8_t)kFusionAddr_StateData ||
+            d.data_seq != 0u ||
+            d.data_len != count) {
+            return Fail(failure, reader, region,
+                        "unexpected_READ_NEXT_DATA",
+                        &d, 0u, received, packets, t0);
+        }
+        memcpy(&data[received], d.data, d.data_len);
+        received += d.data_len;
+        packets++;
+
+        if ((packets % 512u) == 0u) {
+            printf("SvProbe: WRAM_READNEXT_PROGRESS packets=%lu bytes=%lu\n",
+                   (unsigned long)packets,
+                   (unsigned long)received);
+        }
+        if (cfg->wram_chunk_gap_ms != 0u) {
+            vTaskDelay(pdMS_TO_TICKS(cfg->wram_chunk_gap_ms));
+        }
+    }
+
+    const uint32_t crc = FusionSavestate_Crc32(data, region->length);
+    printf("SvProbe: WRAM_READNEXT PASS packets=%lu bytes=%lu crc32=%08lX\n",
+           (unsigned long)packets,
+           (unsigned long)received,
+           (unsigned long)crc);
+    (void)previous_region;
+    return received == region->length;
 }
 
 static bool ReadWramChunked(const ProbeConfig_t *cfg,
@@ -1257,7 +1347,8 @@ static bool RunProbe(const ProbeConfig_t *cfg)
     printf("SvProbe: START mode=%s reduced_logging=%s flash_writes=no "
            "rx_driver_old=%u rx_driver_new=%u local_rx_cache=%u "
            "capture_task=%s task_prio=%u core=%d wram_chunk=%u "
-           "wram_gap_ms=%lu\n",
+           "wram_gap_ms=%lu wram_read_next=%s read_window=%u "
+           "read_window_gap_ms=%u\n",
            cfg->mode_name,
            cfg->reduced_logging ? "yes" : "no",
            (unsigned)kProbeOldRxBufBytes,
@@ -1267,8 +1358,12 @@ static bool RunProbe(const ProbeConfig_t *cfg)
            (unsigned)uxTaskPriorityGet(NULL),
            xPortGetCoreID(),
            (unsigned)cfg->wram_chunk_bytes,
-           (unsigned long)cfg->wram_chunk_gap_ms);
+           (unsigned long)cfg->wram_chunk_gap_ms,
+           cfg->wram_read_next ? "yes" : "no",
+           (unsigned)kProbeReadWindowPackets,
+           (unsigned)kProbeReadWindowGapMs);
 
+    PwrMgr_IdleTimerSuspend();
     bool ok = RunPreflight(cfg, &reader, &failure, &preflight);
     if (ok) {
         printf("SvProbe: save session active\n");
@@ -1277,7 +1372,9 @@ static bool RunProbe(const ProbeConfig_t *cfg)
 
     for (size_t i = 0; ok && i < kProbeRegionCount; ++i) {
         const ProbeRegion_t *previous = (i == 0u) ? NULL : &kRegions[i - 1u];
-        if (kRegions[i].region == 0x0Cu &&
+        if (kRegions[i].region == 0x0Cu && cfg->wram_read_next) {
+            ok = ReadWramReadNext(cfg, &reader, &failure, previous, &kRegions[i]);
+        } else if (kRegions[i].region == 0x0Cu &&
             cfg->wram_chunk_bytes > 0u &&
             cfg->wram_chunk_bytes < kRegions[i].length) {
             ok = ReadWramChunked(cfg, &reader, &failure, previous, &kRegions[i]);
@@ -1308,6 +1405,7 @@ static bool RunProbe(const ProbeConfig_t *cfg)
     if (preflight.owner_acquired) {
         FPGA_UartOwnerRelease();
     }
+    PwrMgr_IdleTimerResume();
 
     printf("SvProbe: RESULT %s mode=%s cleanup_ack=%s resync_non_marker=%lu "
            "bad_len=%lu bad_crc=%lu heap_free=%u heap_min=%u\n",
@@ -1338,15 +1436,29 @@ bool FusionSavestateTransportProbe_RunRepl(bool reduced_logging)
 static void ProbeCaptureTask(void *arg)
 {
     ProbeTaskRequest_t *request = (ProbeTaskRequest_t *)arg;
-    request->ok = RunProbe(&request->cfg);
+    request->ok = true;
+    for (uint8_t i = 0u; i < request->repeat_count; ++i) {
+        if (request->repeat_count > 1u) {
+            printf("SvProbe: REPEAT %u/%u\n",
+                   (unsigned)(i + 1u),
+                   (unsigned)request->repeat_count);
+        }
+        if (!RunProbe(&request->cfg)) {
+            request->ok = false;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
     xTaskNotifyGive(request->caller);
     vTaskDelete(NULL);
 }
 
 static bool RunCaptureTask(const char *mode_name,
                            bool reduced_logging,
+                           bool wram_read_next,
                            uint16_t wram_chunk_bytes,
-                           uint32_t wram_chunk_gap_ms)
+                           uint32_t wram_chunk_gap_ms,
+                           uint8_t repeat_count)
 {
     ProbeTaskRequest_t request = {
         .cfg = {
@@ -1354,10 +1466,12 @@ static bool RunCaptureTask(const char *mode_name,
             .reduced_logging = reduced_logging,
             .boot_mode = false,
             .capture_task = true,
+            .wram_read_next = wram_read_next,
             .wram_chunk_bytes = wram_chunk_bytes,
             .wram_chunk_gap_ms = wram_chunk_gap_ms,
         },
         .caller = xTaskGetCurrentTaskHandle(),
+        .repeat_count = repeat_count,
         .ok = false,
     };
 
@@ -1396,8 +1510,10 @@ static int ProbeCommand(int argc, char **argv)
 {
     const char *mode_name = "repl";
     bool reduced_logging = false;
+    bool wram_read_next = false;
     uint16_t wram_chunk_bytes = (uint16_t)kProbeWramChunkBytes;
     uint32_t wram_chunk_gap_ms = kProbeWramChunkGapMs;
+    uint8_t repeat_count = 1u;
     if (argc >= 2) {
         if (strcmp(argv[1], "menu") == 0) {
             mode_name = "menu";
@@ -1409,11 +1525,34 @@ static int ProbeCommand(int argc, char **argv)
             mode_name = "repl-quiet";
             reduced_logging = true;
         } else if (strcmp(argv[1], "repl") != 0) {
-            printf("Usage: svprobe [menu|game|repl|quiet] [wram_chunk_bytes gap_ms]\n");
+            printf("Usage: svprobe [menu|game|repl|quiet] [repeat count|chunk gap_ms|next gap_ms]\n");
             return 1;
         }
     }
-    if (argc >= 4) {
+    if (argc >= 3 && strcmp(argv[2], "repeat") == 0) {
+        if (argc != 4) {
+            printf("Usage: svprobe [menu|game|repl|quiet] repeat count\n");
+            return 1;
+        }
+        char *end = NULL;
+        const unsigned long count = strtoul(argv[3], &end, 0);
+        if (end == argv[3] || *end != '\0' || count == 0u || count > 10u) {
+            printf("SvProbe: invalid repeat count '%s'\n", argv[3]);
+            return 1;
+        }
+        repeat_count = (uint8_t)count;
+    } else if (argc >= 3 && strcmp(argv[2], "next") == 0) {
+        wram_read_next = true;
+        if (argc >= 4) {
+            char *end = NULL;
+            const unsigned long gap = strtoul(argv[3], &end, 0);
+            if (end == argv[3] || *end != '\0' || gap > 10000u) {
+                printf("SvProbe: invalid WRAM gap ms '%s'\n", argv[3]);
+                return 1;
+            }
+            wram_chunk_gap_ms = (uint32_t)gap;
+        }
+    } else if (argc >= 4) {
         char *end = NULL;
         const unsigned long chunk = strtoul(argv[2], &end, 0);
         if (end == argv[2] || *end != '\0' ||
@@ -1431,20 +1570,22 @@ static int ProbeCommand(int argc, char **argv)
         wram_chunk_bytes = (uint16_t)chunk;
         wram_chunk_gap_ms = (uint32_t)gap;
     } else if (argc == 3) {
-        printf("Usage: svprobe [menu|game|repl|quiet] [wram_chunk_bytes gap_ms]\n");
+        printf("Usage: svprobe [menu|game|repl|quiet] [repeat count|chunk gap_ms|next gap_ms]\n");
         return 1;
     }
     return RunCaptureTask(mode_name,
                           reduced_logging,
+                          wram_read_next,
                           wram_chunk_bytes,
-                          wram_chunk_gap_ms) ? 0 : 1;
+                          wram_chunk_gap_ms,
+                          repeat_count) ? 0 : 1;
 }
 
 void FusionSavestateTransportProbe_RegisterCommands(void)
 {
     const esp_console_cmd_t command = {
         .command = "svprobe",
-        .help = "Phase 4.8a read-transport probe: svprobe [menu|game|repl|quiet] [chunk gap_ms]",
+        .help = "Phase 4.8a read-transport probe: svprobe [menu|game|repl|quiet] [repeat count|chunk gap_ms|next gap_ms]",
         .func = &ProbeCommand,
         .argtable = NULL,
     };

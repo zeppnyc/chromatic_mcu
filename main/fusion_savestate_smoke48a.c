@@ -14,6 +14,7 @@
 #include "fusion_savestate.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "pwrmgr.h"
 #include "savestate_storage.h"
 
 #include <stdbool.h>
@@ -24,6 +25,7 @@
 
 enum {
     kSmoke48aFrameTimeoutMs = 3000,
+    kSmoke48aPreflightDrainMs = 120,
     kSmoke48aInterRegionMs  = 10,
     kSmoke48aFinalEndMs     = 50,
     kSmoke48aRegionCount    = 6,
@@ -204,10 +206,24 @@ static bool SendFrame(const char *label, const FusionV2Frame_t *frame)
     const int written = uart_write_bytes(UART_NUM_1,
                                          (const char *)frame->bytes,
                                          frame->length);
-    (void)uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(250));
+    const bool is_final_cleanup = (strcmp(label, "END_SESSION cleanup") == 0);
+    if (is_final_cleanup) {
+        printf("Smoke48a: TX %s write returned=%d\n", label, written);
+    }
+    const esp_err_t wait_err = uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(250));
+    if (is_final_cleanup) {
+        printf("Smoke48a: TX %s wait result=%s\n",
+               label,
+               esp_err_to_name(wait_err));
+    }
     if (written != (int)frame->length) {
         printf("Smoke48a: TX %s failed wrote=%d expected=%u\n",
                label, written, (unsigned)frame->length);
+        return false;
+    }
+    if (wait_err != ESP_OK) {
+        printf("Smoke48a: TX %s wait failed err=%s\n",
+               label, esp_err_to_name(wait_err));
         return false;
     }
     return true;
@@ -293,8 +309,8 @@ static bool ValidateHeaderEvidence(const uint8_t data[16],
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P470", 4u) != 0) {
-        printf("Smoke48a: Header tag mismatch got='%c%c%c%c' want='P470'\n",
+    if (memcmp(&data[12], "P48G", 4u) != 0) {
+        printf("Smoke48a: Header tag mismatch got='%c%c%c%c' want='P48G'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }
@@ -360,15 +376,43 @@ static bool ReadRegionToSlot(FusionStorage_t *storage,
     if (!SendFrame("READ_STREAM_BEGIN", &begin)) {
         return false;
     }
-    if (!ExpectCtl((uint8_t)kFusionOp_AckAccepted,
-                   (uint8_t)kFusionOp_ReadStreamBegin,
-                   "READ_STREAM_BEGIN ack")) {
+
+    bool pending_data_valid = false;
+    FusionV2Decoded_t pending_data;
+    memset(&pending_data, 0, sizeof(pending_data));
+    FusionV2Decoded_t first;
+    if (!ReadDecodedFrame("READ_STREAM_BEGIN ack", &first)) {
+        return false;
+    }
+    if (first.addr == (uint8_t)kFusionAddr_StateCtl &&
+        first.ctl_opcode == (uint8_t)kFusionOp_Error) {
+        printf("Smoke48a: %s FPGA ERROR code=0x%02X detail=0x%02X\n",
+               region->name, first.error_code, first.error_detail);
+        return false;
+    }
+    if (first.addr == (uint8_t)kFusionAddr_StateCtl &&
+        first.ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
+        first.ack_for_opcode == (uint8_t)kFusionOp_ReadStreamBegin) {
+        /* Expected path. */
+    } else if (first.addr == (uint8_t)kFusionAddr_StateData &&
+               first.data_seq == 0u) {
+        pending_data = first;
+        pending_data_valid = true;
+        printf("Smoke48a: %s DATA arrived before READ_STREAM_BEGIN ACK\n",
+               region->name);
+    } else {
+        printf("Smoke48a: READ_STREAM_BEGIN ack unexpected addr=0x%02X "
+               "op=0x%02X seq=%u\n",
+               first.addr, first.ctl_opcode, (unsigned)first.data_seq);
         return false;
     }
 
     while (received < region->length) {
         FusionV2Decoded_t d;
-        if (!ReadDecodedFrame(region->name, &d)) {
+        if (pending_data_valid) {
+            d = pending_data;
+            pending_data_valid = false;
+        } else if (!ReadDecodedFrame(region->name, &d)) {
             return false;
         }
         if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
@@ -473,10 +517,20 @@ static void ResumeFpgaTraffic(void)
 static bool EndSessionCleanup(void)
 {
     printf("Smoke48a: sending END_SESSION cleanup\n");
+    FusionV2Frame_t frame;
+    if (!BuildEnd(&frame)) {
+        printf("Smoke48a: build END_SESSION cleanup failed\n");
+        return false;
+    }
     DrainRxForMs(kSmoke48aFinalEndMs);
-    return SendCtlAndExpectAck("END_SESSION cleanup",
-                               BuildEnd,
-                               (uint8_t)kFusionOp_EndSession);
+    ResetUartCache();
+    uart_flush_input(UART_NUM_1);
+    if (!SendFrame("END_SESSION cleanup", &frame)) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    printf("Smoke48a: END_SESSION cleanup TX complete; ACK wait skipped\n");
+    return true;
 }
 
 static bool ReadAndCrc(FusionStorage_t *storage,
@@ -541,7 +595,7 @@ static bool ValidateSlot(FusionStorage_t *storage, Smoke48aResult_t *result)
     if (hdr.total_size != ExpectedTotalSize() ||
         hdr.region_count != kSmoke48aRegionCount ||
         hdr.region_bitmap != kExpectedBitmap ||
-        memcmp(hdr.savestate_tag, "P470", 4u) != 0) {
+        memcmp(hdr.savestate_tag, "P48G", 4u) != 0) {
         printf("Smoke48a: metadata mismatch total=%lu/%lu regions=%lu/%u "
                "bitmap=0x%08lX tag='%c%c%c%c'\n",
                (unsigned long)hdr.total_size,
@@ -668,13 +722,6 @@ bool FusionSavestate_QuickSaveSlot0(void)
         next_generation = prior_generation + 1u;
     }
 
-    FusionStorageResult_t sr = FusionStorage_BeginInactiveSlotWrite(&storage);
-    if (sr != kFusionStorage_Ok) {
-        printf("Smoke48a: begin slot write failed result=%d\n", (int)sr);
-        PrintResult(&result);
-        return false;
-    }
-
     FusionRegionDirectory_t dirs[kSmoke48aRegionCount];
     memset(dirs, 0, sizeof(dirs));
     uint32_t next_offset = (uint32_t)sizeof(FusionStateHeader_t);
@@ -683,14 +730,41 @@ bool FusionSavestate_QuickSaveSlot0(void)
     bool ok = true;
     bool session_started = false;
 
+    PwrMgr_IdleTimerSuspend();
     PauseFpgaTraffic();
+    FPGA_Rx_ResetParser();
+    ResetUartCache();
+    if (!FPGA_UartOwnerAcquire(pdMS_TO_TICKS(2000))) {
+        printf("Smoke48a: UART owner unavailable\n");
+        ResumeFpgaTraffic();
+        PwrMgr_IdleTimerResume();
+        PrintResult(&result);
+        return false;
+    }
+
+    FusionStorageResult_t sr = FusionStorage_BeginInactiveSlotWrite(&storage);
+    if (sr != kFusionStorage_Ok) {
+        printf("Smoke48a: begin slot write failed result=%d\n", (int)sr);
+        ResumeFpgaTraffic();
+        FPGA_UartOwnerRelease();
+        PwrMgr_IdleTimerResume();
+        PrintResult(&result);
+        return false;
+    }
+
     do {
+        DrainRxForMs(kSmoke48aPreflightDrainMs);
+        FPGA_Rx_ResetParser();
+        ResetUartCache();
         ok = SendCtlAndExpectAck("END_SESSION clear",
                                  BuildEnd,
                                  (uint8_t)kFusionOp_EndSession);
         if (!ok) {
             break;
         }
+        DrainRxForMs(kSmoke48aPreflightDrainMs);
+        FPGA_Rx_ResetParser();
+        ResetUartCache();
         ok = SendCtlAndExpectAck("BEGIN_SAVE",
                                  BuildBeginSave,
                                  (uint8_t)kFusionOp_BeginSave);
@@ -720,10 +794,12 @@ bool FusionSavestate_QuickSaveSlot0(void)
     if (session_started) {
         cleanup_ok = EndSessionCleanup();
     }
-    ResumeFpgaTraffic();
 
     if (!ok || !cleanup_ok) {
         (void)FusionStorage_AbortSlotWrite(&storage);
+        ResumeFpgaTraffic();
+        FPGA_UartOwnerRelease();
+        PwrMgr_IdleTimerResume();
         PrintResult(&result);
         return false;
     }
@@ -732,7 +808,7 @@ bool FusionSavestate_QuickSaveSlot0(void)
     FusionStateHeader_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.game_id_algorithm = (uint8_t)FUSION_GAME_ID_ALGORITHM_V1;
-    memcpy(hdr.fpga_version, "P470", 4u);
+    memcpy(hdr.fpga_version, "P48G", 4u);
     const esp_app_desc_t *desc = esp_app_get_description();
     if (desc != NULL) {
         memcpy(hdr.mcu_version, desc->version,
@@ -744,23 +820,35 @@ bool FusionSavestate_QuickSaveSlot0(void)
     hdr.region_bitmap = region_bitmap;
     memcpy(hdr.savestate_tag, savestate_tag, sizeof(hdr.savestate_tag));
 
+    printf("Smoke48a: staging slot header\n");
     sr = FusionStorage_StageHeader(&storage, &hdr, dirs, kSmoke48aRegionCount);
     if (sr != kFusionStorage_Ok) {
         printf("Smoke48a: stage header failed result=%d\n", (int)sr);
         (void)FusionStorage_AbortSlotWrite(&storage);
+        ResumeFpgaTraffic();
+        FPGA_UartOwnerRelease();
+        PwrMgr_IdleTimerResume();
         PrintResult(&result);
         return false;
     }
+    printf("Smoke48a: committing slot\n");
     sr = FusionStorage_VerifyAndCommit(&storage);
     if (sr != kFusionStorage_Ok) {
         printf("Smoke48a: verify/commit failed result=%d\n", (int)sr);
         (void)FusionStorage_AbortSlotWrite(&storage);
+        ResumeFpgaTraffic();
+        FPGA_UartOwnerRelease();
+        PwrMgr_IdleTimerResume();
         PrintResult(&result);
         return false;
     }
     result.slot_committed = true;
 
+    printf("Smoke48a: validating committed slot\n");
     (void)ValidateSlot(&storage, &result);
+    ResumeFpgaTraffic();
+    FPGA_UartOwnerRelease();
+    PwrMgr_IdleTimerResume();
     PrintResult(&result);
     return result.load_ready;
 }
