@@ -184,6 +184,12 @@ static void test_ctl_builders(void)
     EXPECT_EQ_U(d.payload[4], 0x7Fu);
     EXPECT_EQ_U(d.payload[5], 0x00u);
 
+    EXPECT(FusionSavestate_BuildReadStreamContinue(0x1234u, &frame));
+    EXPECT(FusionSavestate_DecodeV2Frame(frame.bytes, frame.length, &d));
+    EXPECT_EQ_U(d.ctl_opcode, (uint8_t)kFusionOp_ReadStreamContinue);
+    EXPECT_EQ_U(d.payload[1], 0x34u);
+    EXPECT_EQ_U(d.payload[2], 0x12u);
+
     EXPECT(FusionSavestate_BuildAckAccepted(kFusionOp_BeginLoad, &frame));
     EXPECT(FusionSavestate_DecodeV2Frame(frame.bytes, frame.length, &d));
     EXPECT_EQ_U(d.ctl_opcode, (uint8_t)kFusionOp_AckAccepted);

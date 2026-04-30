@@ -36,7 +36,8 @@ enum {
     kProbePostCleanupDrainMs = 60,
     kProbeBoundaryDrainMs = 10,
     kProbeBoundaryRawDrainMs = 2,
-    kProbeWramChunkBytes = 512,
+    kProbeReadWindowPackets = 16,
+    kProbeWramChunkBytes = 0,
     kProbeWramChunkGapMs = 50,
 };
 
@@ -83,6 +84,7 @@ typedef struct {
     bool ack_accepted;
     bool ack_done;
     bool stream_done_seen;
+    uint32_t continue_count;
     ProbeFrameSummary_t last_frame;
 } ProbeRegionStats_t;
 
@@ -272,7 +274,8 @@ static void PrintRegionSummary(const ProbeRegionStats_t *stats,
 {
     printf("SvProbe: REGION_SUMMARY %s status=%s id=0x%02X offset=%u length=%u "
            "chunk=%d packets=%lu bytes=%lu elapsed_ms=%lld ack_accepted=%s "
-           "ack_done=%s boundary_stale_frames=%lu boundary_drain_bytes=%lu\n",
+           "ack_done=%s continue_count=%lu boundary_stale_frames=%lu "
+           "boundary_drain_bytes=%lu\n",
            stats->current_region != NULL ? stats->current_region->name : "(none)",
            status,
            stats->current_region != NULL ? (unsigned)stats->current_region->region : 0u,
@@ -284,6 +287,7 @@ static void PrintRegionSummary(const ProbeRegionStats_t *stats,
            (long long)elapsed_ms,
            stats->ack_accepted ? "yes" : "no",
            stats->ack_done ? "yes" : "no",
+           (unsigned long)stats->continue_count,
            (unsigned long)stats->boundary_stale_frames,
            (unsigned long)stats->boundary_drain_bytes);
 }
@@ -613,8 +617,8 @@ static bool ValidateHeader(const uint8_t *data)
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P470", 4u) != 0) {
-        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P470'\n",
+    if (memcmp(&data[12], "P48P", 4u) != 0) {
+        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48P'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }
@@ -801,6 +805,7 @@ static bool ReadRegionRange(const ProbeConfig_t *cfg,
 {
     uint32_t received = 0u;
     uint32_t packets = 0u;
+    uint16_t window_packets = 0u;
     uint16_t expected_seq = 0u;
     const int64_t t0 = esp_timer_get_time();
     ProbeRegionStats_t stats = {
@@ -890,9 +895,34 @@ static bool ReadRegionRange(const ProbeConfig_t *cfg,
         received += d.data_len;
         packets++;
         expected_seq++;
+        window_packets++;
         stats.bytes = received;
         stats.packets = packets;
         stats.expected_seq = expected_seq;
+
+        if (received < length && window_packets >= kProbeReadWindowPackets) {
+            FusionV2Frame_t cont;
+            if (!FusionSavestate_BuildReadStreamContinue(expected_seq, &cont)) {
+                PrintRegionSummary(&stats, "FAIL",
+                                   (esp_timer_get_time() - t0) / 1000);
+                PrintRegionFailureContext(&stats, "READ_STREAM_CONTINUE build",
+                                          NULL, reader);
+                return Fail(failure, reader, region,
+                            "build_READ_STREAM_CONTINUE_failed",
+                            NULL, expected_seq, received, packets, t0);
+            }
+            if (!SendFrame(cfg, "READ_STREAM_CONTINUE", &cont)) {
+                PrintRegionSummary(&stats, "FAIL",
+                                   (esp_timer_get_time() - t0) / 1000);
+                PrintRegionFailureContext(&stats, "READ_STREAM_CONTINUE tx",
+                                          NULL, reader);
+                return Fail(failure, reader, region,
+                            "tx_READ_STREAM_CONTINUE_failed",
+                            NULL, expected_seq, received, packets, t0);
+            }
+            stats.continue_count++;
+            window_packets = 0u;
+        }
     }
     stats.stream_done_seen = true;
 
@@ -1247,7 +1277,9 @@ static bool RunProbe(const ProbeConfig_t *cfg)
 
     for (size_t i = 0; ok && i < kProbeRegionCount; ++i) {
         const ProbeRegion_t *previous = (i == 0u) ? NULL : &kRegions[i - 1u];
-        if (kRegions[i].region == 0x0Cu) {
+        if (kRegions[i].region == 0x0Cu &&
+            cfg->wram_chunk_bytes > 0u &&
+            cfg->wram_chunk_bytes < kRegions[i].length) {
             ok = ReadWramChunked(cfg, &reader, &failure, previous, &kRegions[i]);
         } else {
             ok = ReadRegion(cfg, &reader, &failure, previous, &kRegions[i]);

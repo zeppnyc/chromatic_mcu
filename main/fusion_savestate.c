@@ -196,6 +196,17 @@ bool FusionSavestate_BuildReadStreamBegin(uint8_t region,
                             region, offset, length, out);
 }
 
+bool FusionSavestate_BuildReadStreamContinue(uint16_t next_seq,
+                                             FusionV2Frame_t *out)
+{
+    const uint8_t p[3] = {
+        (uint8_t)kFusionOp_ReadStreamContinue,
+        (uint8_t)(next_seq & 0xFFu),
+        (uint8_t)((next_seq >> 8) & 0xFFu),
+    };
+    return BuildCtl(p, sizeof(p), out);
+}
+
 bool FusionSavestate_BuildWriteStreamBegin(uint8_t region,
                                            uint16_t offset,
                                            uint16_t length,

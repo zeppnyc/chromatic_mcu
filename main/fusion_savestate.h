@@ -54,6 +54,7 @@ typedef enum {
     kFusionOp_ReadStreamBegin  = 0x06u,
     kFusionOp_WriteStreamBegin = 0x07u,
     kFusionOp_WriteCommit      = 0x08u,
+    kFusionOp_ReadStreamContinue = 0x09u,
     /* FPGA -> MCU */
     kFusionOp_AckAccepted      = 0x10u,
     kFusionOp_Busy             = 0x11u,
@@ -185,6 +186,8 @@ bool FusionSavestate_BuildReadStreamBegin(uint8_t region,
                                           uint16_t offset,
                                           uint16_t length,
                                           FusionV2Frame_t *out);
+bool FusionSavestate_BuildReadStreamContinue(uint16_t next_seq,
+                                             FusionV2Frame_t *out);
 bool FusionSavestate_BuildWriteStreamBegin(uint8_t region,
                                            uint16_t offset,
                                            uint16_t length,
