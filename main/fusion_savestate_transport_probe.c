@@ -27,6 +27,8 @@ enum {
     kProbeRegionCount    = 6,
     kProbeRxCacheBytes   = 512,
     kProbeOldRxBufBytes  = 1024,
+    kProbeCaptureStackBytes = 12288,
+    kProbeCapturePriority = configMAX_PRIORITIES - 2,
 };
 
 static const char *TAG = "SvProbe";
@@ -52,7 +54,14 @@ typedef struct {
     const char *mode_name;
     bool reduced_logging;
     bool boot_mode;
+    bool capture_task;
 } ProbeConfig_t;
+
+typedef struct {
+    ProbeConfig_t cfg;
+    TaskHandle_t caller;
+    bool ok;
+} ProbeTaskRequest_t;
 
 typedef struct {
     const ProbeRegion_t *region;
@@ -88,6 +97,9 @@ static const ProbeRegion_t kRegions[kProbeRegionCount] = {
 
 static uint8_t *s_rx_buf = NULL;
 static size_t s_rx_buf_len = 0u;
+static bool s_lvgl_suspended = false;
+
+extern TaskHandle_t FusionApp_GetLvglTimerTaskHandle(void);
 
 static bool EnsureRxBuf(uint16_t need)
 {
@@ -534,14 +546,32 @@ static void PauseNormalUartTasks(void)
 {
     TaskHandle_t *tx = FPGA_GetTxTaskHandle();
     TaskHandle_t *rx = FPGA_GetRxTaskHandle();
+    bool tx_paused = false;
+    bool rx_paused = false;
+    bool lvgl_paused = false;
+
+    TaskHandle_t lvgl = FusionApp_GetLvglTimerTaskHandle();
+    if (lvgl != NULL && lvgl != xTaskGetCurrentTaskHandle()) {
+        vTaskSuspend(lvgl);
+        lvgl_paused = true;
+        s_lvgl_suspended = true;
+    } else {
+        s_lvgl_suspended = false;
+    }
     if (tx != NULL && *tx != NULL) {
         FPGA_Tx_Pause();
+        tx_paused = true;
     }
     if (rx != NULL && *rx != NULL) {
         FPGA_Rx_Pause();
+        rx_paused = true;
     }
     vTaskDelay(pdMS_TO_TICKS(30));
     uart_flush(UART_NUM_1);
+    printf("SvProbe: PAUSE tx=%s rx=%s lvgl=%s\n",
+           tx_paused ? "yes" : "no",
+           rx_paused ? "yes" : "no",
+           lvgl_paused ? "yes" : "no");
 }
 
 static void ResumeNormalUartTasks(void)
@@ -554,6 +584,13 @@ static void ResumeNormalUartTasks(void)
     if (tx != NULL && *tx != NULL) {
         FPGA_Tx_Resume();
     }
+    if (s_lvgl_suspended) {
+        TaskHandle_t lvgl = FusionApp_GetLvglTimerTaskHandle();
+        if (lvgl != NULL) {
+            vTaskResume(lvgl);
+        }
+        s_lvgl_suspended = false;
+    }
 }
 
 static bool RunProbe(const ProbeConfig_t *cfg)
@@ -564,12 +601,16 @@ static bool RunProbe(const ProbeConfig_t *cfg)
     memset(&failure, 0, sizeof(failure));
 
     printf("SvProbe: START mode=%s reduced_logging=%s flash_writes=no "
-           "rx_driver_old=%u rx_driver_new=%u local_rx_cache=%u\n",
+           "rx_driver_old=%u rx_driver_new=%u local_rx_cache=%u "
+           "capture_task=%s task_prio=%u core=%d\n",
            cfg->mode_name,
            cfg->reduced_logging ? "yes" : "no",
            (unsigned)kProbeOldRxBufBytes,
            (unsigned)kFPGA_RxConsts_BufferSize,
-           (unsigned)kProbeRxCacheBytes);
+           (unsigned)kProbeRxCacheBytes,
+           cfg->capture_task ? "yes" : "no",
+           (unsigned)uxTaskPriorityGet(NULL),
+           xPortGetCoreID());
 
     if (!cfg->boot_mode) {
         PauseNormalUartTasks();
@@ -634,8 +675,45 @@ bool FusionSavestateTransportProbe_RunRepl(bool reduced_logging)
         .mode_name = reduced_logging ? "repl-quiet" : "repl",
         .reduced_logging = reduced_logging,
         .boot_mode = false,
+        .capture_task = false,
     };
     return RunProbe(&cfg);
+}
+
+static void ProbeCaptureTask(void *arg)
+{
+    ProbeTaskRequest_t *request = (ProbeTaskRequest_t *)arg;
+    request->ok = RunProbe(&request->cfg);
+    xTaskNotifyGive(request->caller);
+    vTaskDelete(NULL);
+}
+
+static bool RunCaptureTask(const char *mode_name, bool reduced_logging)
+{
+    ProbeTaskRequest_t request = {
+        .cfg = {
+            .mode_name = mode_name,
+            .reduced_logging = reduced_logging,
+            .boot_mode = false,
+            .capture_task = true,
+        },
+        .caller = xTaskGetCurrentTaskHandle(),
+        .ok = false,
+    };
+
+    BaseType_t created = xTaskCreatePinnedToCore(ProbeCaptureTask,
+                                                 "sv_capture",
+                                                 kProbeCaptureStackBytes,
+                                                 &request,
+                                                 kProbeCapturePriority,
+                                                 NULL,
+                                                 0);
+    if (created != pdPASS) {
+        printf("SvProbe: failed to create capture task\n");
+        return false;
+    }
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return request.ok;
 }
 
 void FusionSavestateTransportProbe_RunBootProbeOnce(void)
@@ -647,29 +725,38 @@ void FusionSavestateTransportProbe_RunBootProbeOnce(void)
         .mode_name = "boot-final-only",
         .reduced_logging = true,
         .boot_mode = true,
+        .capture_task = false,
     };
     (void)RunProbe(&cfg);
 }
 
 static int ProbeCommand(int argc, char **argv)
 {
+    const char *mode_name = "repl";
     bool reduced_logging = false;
     if (argc >= 2) {
-        if (strcmp(argv[1], "quiet") == 0 || strcmp(argv[1], "reduced") == 0) {
+        if (strcmp(argv[1], "menu") == 0) {
+            mode_name = "menu";
+            reduced_logging = true;
+        } else if (strcmp(argv[1], "game") == 0) {
+            mode_name = "game";
+            reduced_logging = true;
+        } else if (strcmp(argv[1], "quiet") == 0 || strcmp(argv[1], "reduced") == 0) {
+            mode_name = "repl-quiet";
             reduced_logging = true;
         } else if (strcmp(argv[1], "repl") != 0) {
-            printf("Usage: svprobe [repl|quiet]\n");
+            printf("Usage: svprobe [menu|game|repl|quiet]\n");
             return 1;
         }
     }
-    return FusionSavestateTransportProbe_RunRepl(reduced_logging) ? 0 : 1;
+    return RunCaptureTask(mode_name, reduced_logging) ? 0 : 1;
 }
 
 void FusionSavestateTransportProbe_RegisterCommands(void)
 {
     const esp_console_cmd_t command = {
         .command = "svprobe",
-        .help = "Phase 4.8a read-transport probe: svprobe [repl|quiet]",
+        .help = "Phase 4.8a read-transport probe: svprobe [menu|game|repl|quiet]",
         .func = &ProbeCommand,
         .argtable = NULL,
     };

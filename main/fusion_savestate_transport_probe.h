@@ -12,7 +12,10 @@
  *
  * Final-only boot probing is available only when the firmware is built with
  * FUSION_TRANSPORT_PROBE_BOOT_AUTO. The default production build has no
- * auto-run path; use the REPL command instead.
+ * auto-run path; use the REPL command instead:
+ *   svprobe menu   - read-only capture in menu/flash-cart state
+ *   svprobe game   - read-only capture in simple-game state
+ *   svprobe quiet  - generic reduced-log capture
  */
 
 bool FusionSavestateTransportProbe_RunRepl(bool reduced_logging);

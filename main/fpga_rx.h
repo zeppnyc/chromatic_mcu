@@ -18,7 +18,7 @@ typedef enum {
 } RxIDs_t;
 
 typedef enum {
-    kFPGA_RxConsts_BufferSize = 8192,    // [bytes]
+    kFPGA_RxConsts_BufferSize = 32768,    // [bytes]
 } FPGA_RxConsts_t;
 
 void FPGA_RxTask(void *arg);

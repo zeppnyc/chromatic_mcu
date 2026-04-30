@@ -66,6 +66,12 @@ static spi_device_handle_t spi;
 static lv_disp_draw_buf_t disp_buf; // contains internal graphic buffer(s) called draw buffer(s)
 static lv_disp_drv_t disp_drv;      // contains callback functions
 static lv_disp_t *disp;
+static TaskHandle_t lvglTimerTaskHandle = NULL;
+
+TaskHandle_t FusionApp_GetLvglTimerTaskHandle(void)
+{
+    return lvglTimerTaskHandle;
+}
 
 // Having some issue with floating point here so scale 9.6 10x
 #define ROWS_PER_XFER_X10 32
@@ -342,7 +348,7 @@ void app_main(void)
 
     Gfx_Start(scr);
 
-    xTaskCreatePinnedToCore(lvglTimerTask, "lvgl Timer", kTimerTask_StackDepth, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(lvglTimerTask, "lvgl Timer", kTimerTask_StackDepth, NULL, 4, &lvglTimerTaskHandle, 1);
 
     // Prompt to be printed before each line.
     ReplConfig.prompt = "mcu> ";
