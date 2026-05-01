@@ -23,6 +23,7 @@
 #include "fpga_tx.h"
 #include "frameblend.h"
 #include "fusion_savestate_smoke48a.h"
+#include "fusion_savestate_smoke48c.h"
 #include "fusion_savestate_transport_probe.h"
 #include "fw.h"
 #include "osd.h"
@@ -361,6 +362,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&ReplHWConfig, &ReplConfig, &pRepl));
     esp_console_register_help_command();
     FusionSavestateSmoke48a_RegisterCommands();
+    FusionSavestateSmoke48c_RegisterCommands();
     FusionSavestateTransportProbe_RegisterCommands();
     // All commands must be registered prior to starting the REPL
     ESP_ERROR_CHECK(esp_console_start_repl(pRepl));
