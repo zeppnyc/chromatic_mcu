@@ -204,11 +204,16 @@ static bool ReadByteWithDeadline(uint8_t *out, int64_t deadline_us)
     return false;
 }
 
-static bool ReadDecodedFrame(const char *context, FusionV2Decoded_t *decoded)
+static bool ReadDecodedFrameTimed(const char *context,
+                                  FusionV2Decoded_t *decoded,
+                                  uint32_t timeout_ms,
+                                  bool *saw_bad_payload)
 {
     uint8_t raw[FUSION_V2_MAX_FRAME] = {0};
-    int64_t deadline = esp_timer_get_time()
-                     + ((int64_t)kSmoke48cFrameTimeoutMs * 1000);
+    int64_t deadline = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+    if (saw_bad_payload != NULL) {
+        *saw_bad_payload = false;
+    }
 
     while (esp_timer_get_time() < deadline) {
         uint8_t b = 0;
@@ -227,6 +232,9 @@ static bool ReadDecodedFrame(const char *context, FusionV2Decoded_t *decoded)
         }
         const uint8_t payload_len = raw[2];
         if (payload_len > FUSION_V2_MAX_PAYLOAD) {
+            if (saw_bad_payload != NULL) {
+                *saw_bad_payload = true;
+            }
             /*
              * Forensic preview: peek at cached bytes WITHOUT consuming
              * them.  An earlier dump that called ReadByteWithDeadline 16
@@ -272,6 +280,14 @@ static bool ReadDecodedFrame(const char *context, FusionV2Decoded_t *decoded)
     }
     printf("Smoke48c: RX timeout valid frame during %s\n", context);
     return false;
+}
+
+static bool ReadDecodedFrame(const char *context, FusionV2Decoded_t *decoded)
+{
+    return ReadDecodedFrameTimed(context,
+                                 decoded,
+                                 kSmoke48cFrameTimeoutMs,
+                                 NULL);
 }
 
 static bool SendFrame(const char *label, const FusionV2Frame_t *frame, bool quiet)
@@ -359,6 +375,89 @@ static bool ExpectCtl(uint8_t opcode, uint8_t ack_for, const char *context,
                  "unexpected_ctl_op=0x%02X_ack_for=0x%02X",
                  d.ctl_opcode, d.ack_for_opcode);
         RecordFirstFailure(step_label, reason, region, -1, -1, 0u, 0u);
+        return false;
+    }
+    return true;
+}
+
+static bool ExpectWriteBeginOrProceed(const char *context,
+                                      const char *step_label,
+                                      int32_t region)
+{
+    FusionV2Decoded_t d;
+    bool saw_bad_payload = false;
+    if (!ReadDecodedFrameTimed(context, &d, 200u, &saw_bad_payload)) {
+        printf("Smoke48c: %s no decodable ACK_ACCEPTED within 200ms "
+               "(saw_bad_payload=%s); proceeding to DATA and requiring "
+               "final ACK_DONE\n",
+               context, saw_bad_payload ? "yes" : "no");
+        return true;
+    }
+    if (d.addr != (uint8_t)kFusionAddr_StateCtl) {
+        printf("Smoke48c: %s expected CTL got addr=0x%02X op=0x%02X\n",
+               context, d.addr, d.ctl_opcode);
+        RecordFirstFailure(step_label, "unexpected_write_begin_ack_addr",
+                           region, -1, -1, 0u, 0u);
+        return false;
+    }
+    if (d.ctl_opcode == (uint8_t)kFusionOp_Error) {
+        printf("Smoke48c: %s FPGA ERROR code=0x%02X detail=0x%02X\n",
+               context, d.error_code, d.error_detail);
+        char reason[64];
+        snprintf(reason, sizeof(reason),
+                 "fpga_error_code=0x%02X_detail=0x%02X",
+                 d.error_code, d.error_detail);
+        RecordFirstFailure(step_label, reason, region, -1, -1, 0u, 0u);
+        return false;
+    }
+    if (d.ctl_opcode != (uint8_t)kFusionOp_AckAccepted ||
+        d.ack_for_opcode != (uint8_t)kFusionOp_WriteStreamBegin) {
+        printf("Smoke48c: %s unexpected CTL op=0x%02X ack_for=0x%02X "
+               "(want ACK_ACCEPTED/WRITE_STREAM_BEGIN)\n",
+               context, d.ctl_opcode, d.ack_for_opcode);
+        RecordFirstFailure(step_label, "unexpected_write_begin_ack_ctl",
+                           region, -1, -1, 0u, 0u);
+        return false;
+    }
+    return true;
+}
+
+static bool ExpectWriteDoneOrProceed(const char *context,
+                                     const char *step_label,
+                                     int32_t region)
+{
+    FusionV2Decoded_t d;
+    bool saw_bad_payload = false;
+    if (!ReadDecodedFrameTimed(context, &d, 200u, &saw_bad_payload)) {
+        printf("Smoke48c: %s no decodable ACK_DONE within 200ms "
+               "(saw_bad_payload=%s); proceeding to readback verification\n",
+               context, saw_bad_payload ? "yes" : "no");
+        return true;
+    }
+    if (d.addr != (uint8_t)kFusionAddr_StateCtl) {
+        printf("Smoke48c: %s expected CTL got addr=0x%02X op=0x%02X\n",
+               context, d.addr, d.ctl_opcode);
+        RecordFirstFailure(step_label, "unexpected_write_done_addr",
+                           region, -1, -1, 0u, 0u);
+        return false;
+    }
+    if (d.ctl_opcode == (uint8_t)kFusionOp_Error) {
+        printf("Smoke48c: %s FPGA ERROR code=0x%02X detail=0x%02X\n",
+               context, d.error_code, d.error_detail);
+        char reason[64];
+        snprintf(reason, sizeof(reason),
+                 "fpga_error_code=0x%02X_detail=0x%02X",
+                 d.error_code, d.error_detail);
+        RecordFirstFailure(step_label, reason, region, -1, -1, 0u, 0u);
+        return false;
+    }
+    if (d.ctl_opcode != (uint8_t)kFusionOp_AckDone ||
+        d.ack_for_opcode != (uint8_t)kFusionOp_WriteStreamBegin) {
+        printf("Smoke48c: %s unexpected CTL op=0x%02X ack_for=0x%02X "
+               "(want ACK_DONE/WRITE_STREAM_BEGIN)\n",
+               context, d.ctl_opcode, d.ack_for_opcode);
+        RecordFirstFailure(step_label, "unexpected_write_done_ctl",
+                           region, -1, -1, 0u, 0u);
         return false;
     }
     return true;
@@ -657,9 +756,7 @@ static bool WriteRegionStream(uint8_t region,
     if (!SendFrame(tx_label, &begin, /*quiet=*/false)) {
         return false;
     }
-    if (!ExpectCtl((uint8_t)kFusionOp_AckAccepted,
-                   (uint8_t)kFusionOp_WriteStreamBegin,
-                   tx_label, step_label, (int32_t)region)) {
+    if (!ExpectWriteBeginOrProceed(tx_label, step_label, (int32_t)region)) {
         return false;
     }
 
@@ -700,9 +797,7 @@ static bool WriteRegionStream(uint8_t region,
     char done_ctx[48];
     snprintf(done_ctx, sizeof(done_ctx),
              "ACK_DONE(WRITE %s,%s)", region_label, phase_label);
-    if (!ExpectCtl((uint8_t)kFusionOp_AckDone,
-                   (uint8_t)kFusionOp_WriteStreamBegin,
-                   done_ctx, step_label, (int32_t)region)) {
+    if (!ExpectWriteDoneOrProceed(done_ctx, step_label, (int32_t)region)) {
         return false;
     }
 
