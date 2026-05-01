@@ -29,6 +29,7 @@ enum {
     kSmoke48aInterRegionMs  = 10,
     kSmoke48aFinalEndMs     = 50,
     kSmoke48aRegionCount    = 6,
+    kSmoke48aEndSessionAttempts = 4,
 };
 
 static const char *TAG = "Smoke48a";
@@ -63,6 +64,9 @@ static size_t s_rx_buf_len = 0u;
 static uint8_t s_uart_cache[512];
 static size_t s_uart_cache_pos = 0u;
 static size_t s_uart_cache_len = 0u;
+
+static bool BuildEnd(FusionV2Frame_t *out);
+static void DrainRxForMs(uint32_t ms);
 
 static bool EnsureRxBuf(uint16_t need)
 {
@@ -267,6 +271,38 @@ static bool SendCtlAndExpectAck(const char *label,
     return ExpectCtl((uint8_t)kFusionOp_AckAccepted, ack_for, label);
 }
 
+static bool IsEndSessionAck(const FusionV2Decoded_t *d)
+{
+    return d != NULL &&
+           d->addr == (uint8_t)kFusionAddr_StateCtl &&
+           d->ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
+           d->ack_for_opcode == (uint8_t)kFusionOp_EndSession;
+}
+
+static bool SendEndSessionClear(const char *label)
+{
+    FusionV2Frame_t frame;
+    if (!BuildEnd(&frame)) {
+        printf("Smoke48a: build %s failed\n", label);
+        return false;
+    }
+
+    for (uint8_t attempt = 0u; attempt < kSmoke48aEndSessionAttempts; ++attempt) {
+        if (attempt != 0u) {
+            DrainRxForMs(kSmoke48aPreflightDrainMs);
+            ResetUartCache();
+        }
+        if (!SendFrame(label, &frame)) {
+            return false;
+        }
+        FusionV2Decoded_t d;
+        if (ReadDecodedFrame(label, &d) && IsEndSessionAck(&d)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void DrainRxForMs(uint32_t ms)
 {
     uint8_t scratch[128];
@@ -309,8 +345,8 @@ static bool ValidateHeaderEvidence(const uint8_t data[16],
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P48G", 4u) != 0) {
-        printf("Smoke48a: Header tag mismatch got='%c%c%c%c' want='P48G'\n",
+    if (memcmp(&data[12], "P48C", 4u) != 0) {
+        printf("Smoke48a: Header tag mismatch got='%c%c%c%c' want='P48C'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }
@@ -542,6 +578,7 @@ static bool ReadAndCrc(FusionStorage_t *storage,
     uint32_t crc = 0u;
     uint8_t buf[256];
     uint32_t pos = 0u;
+    PwrMgr_IdleTimerPet();
     while (pos < length) {
         const uint32_t chunk = ((length - pos) > sizeof(buf))
             ? (uint32_t)sizeof(buf)
@@ -557,6 +594,7 @@ static bool ReadAndCrc(FusionStorage_t *storage,
         }
         crc = FusionSavestate_Crc32Update(crc, buf, chunk);
         pos += chunk;
+        PwrMgr_IdleTimerPet();
     }
     *crc_out = crc;
     return true;
@@ -574,6 +612,7 @@ static bool ValidateSlot(FusionStorage_t *storage, Smoke48aResult_t *result)
     }
 
     FusionStateHeader_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
     sr = FusionStorage_ReadSlotHeader(storage, slot, &hdr);
     if (sr != kFusionStorage_Ok) {
         printf("Smoke48a: read slot header failed result=%d\n", (int)sr);
@@ -595,7 +634,7 @@ static bool ValidateSlot(FusionStorage_t *storage, Smoke48aResult_t *result)
     if (hdr.total_size != ExpectedTotalSize() ||
         hdr.region_count != kSmoke48aRegionCount ||
         hdr.region_bitmap != kExpectedBitmap ||
-        memcmp(hdr.savestate_tag, "P48G", 4u) != 0) {
+        memcmp(hdr.savestate_tag, "P48C", 4u) != 0) {
         printf("Smoke48a: metadata mismatch total=%lu/%lu regions=%lu/%u "
                "bitmap=0x%08lX tag='%c%c%c%c'\n",
                (unsigned long)hdr.total_size,
@@ -694,6 +733,8 @@ static bool InitStorage(FusionStorage_t *storage)
 
 bool FusionSavestate_QuickLoadSlot0(void)
 {
+    PwrMgr_IdleTimerPet();
+
     Smoke48aResult_t result = {0};
     FusionStorage_t storage;
     if (!InitStorage(&storage)) {
@@ -742,23 +783,11 @@ bool FusionSavestate_QuickSaveSlot0(void)
         return false;
     }
 
-    FusionStorageResult_t sr = FusionStorage_BeginInactiveSlotWrite(&storage);
-    if (sr != kFusionStorage_Ok) {
-        printf("Smoke48a: begin slot write failed result=%d\n", (int)sr);
-        ResumeFpgaTraffic();
-        FPGA_UartOwnerRelease();
-        PwrMgr_IdleTimerResume();
-        PrintResult(&result);
-        return false;
-    }
-
     do {
         DrainRxForMs(kSmoke48aPreflightDrainMs);
         FPGA_Rx_ResetParser();
         ResetUartCache();
-        ok = SendCtlAndExpectAck("END_SESSION clear",
-                                 BuildEnd,
-                                 (uint8_t)kFusionOp_EndSession);
+        ok = SendEndSessionClear("END_SESSION clear");
         if (!ok) {
             break;
         }
@@ -774,6 +803,13 @@ bool FusionSavestate_QuickSaveSlot0(void)
         session_started = true;
         printf("Smoke48a: save session active\n");
         vTaskDelay(pdMS_TO_TICKS(50));
+
+        FusionStorageResult_t sr = FusionStorage_BeginInactiveSlotWrite(&storage);
+        if (sr != kFusionStorage_Ok) {
+            printf("Smoke48a: begin slot write failed result=%d\n", (int)sr);
+            ok = false;
+            break;
+        }
 
         for (size_t i = 0; i < kSmoke48aRegionCount; ++i) {
             ok = ReadRegionToSlot(&storage,
@@ -808,7 +844,7 @@ bool FusionSavestate_QuickSaveSlot0(void)
     FusionStateHeader_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.game_id_algorithm = (uint8_t)FUSION_GAME_ID_ALGORITHM_V1;
-    memcpy(hdr.fpga_version, "P48G", 4u);
+    memcpy(hdr.fpga_version, "P48C", 4u);
     const esp_app_desc_t *desc = esp_app_get_description();
     if (desc != NULL) {
         memcpy(hdr.mcu_version, desc->version,
@@ -821,7 +857,8 @@ bool FusionSavestate_QuickSaveSlot0(void)
     memcpy(hdr.savestate_tag, savestate_tag, sizeof(hdr.savestate_tag));
 
     printf("Smoke48a: staging slot header\n");
-    sr = FusionStorage_StageHeader(&storage, &hdr, dirs, kSmoke48aRegionCount);
+    FusionStorageResult_t sr =
+        FusionStorage_StageHeader(&storage, &hdr, dirs, kSmoke48aRegionCount);
     if (sr != kFusionStorage_Ok) {
         printf("Smoke48a: stage header failed result=%d\n", (int)sr);
         (void)FusionStorage_AbortSlotWrite(&storage);

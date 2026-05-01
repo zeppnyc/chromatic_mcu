@@ -34,6 +34,7 @@ enum {
     kProbeOwnerAcquireMs = 1000,
     kProbePreflightDrainMs = 60,
     kProbeCleanupAckMs = 500,
+    kProbeEndSessionAttempts = 4,
     kProbePostCleanupDrainMs = 60,
     kProbeBoundaryDrainMs = 10,
     kProbeBoundaryRawDrainMs = 2,
@@ -593,30 +594,53 @@ static bool BuildBeginSave(FusionV2Frame_t *out)
     return FusionSavestate_BuildBeginSave(0u, out);
 }
 
-static bool SendCtlAndExpectAck(const ProbeConfig_t *cfg,
-                                ProbeReader_t *reader,
-                                ProbeFailure_t *failure,
-                                const char *label,
-                                bool (*builder)(FusionV2Frame_t *out),
-                                uint8_t ack_for,
-                                bool final_end)
+static bool WaitEndSessionAck(ProbeReader_t *reader,
+                              const char *context,
+                              uint32_t timeout_ms)
 {
-    const int64_t t0 = esp_timer_get_time();
+    const int64_t deadline = esp_timer_get_time()
+                           + ((int64_t)timeout_ms * 1000);
+    while (esp_timer_get_time() < deadline) {
+        FusionV2Decoded_t d;
+        const int64_t now = esp_timer_get_time();
+        const uint32_t remain_ms =
+            (uint32_t)((deadline > now) ? ((deadline - now + 999) / 1000) : 0);
+        if (remain_ms == 0u ||
+            !ReadDecodedFrameWithTimeout(reader, context, remain_ms, true, &d)) {
+            break;
+        }
+        if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
+            d.ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
+            d.ack_for_opcode == (uint8_t)kFusionOp_EndSession) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool SendEndSessionCleanup(const ProbeConfig_t *cfg,
+                                  ProbeReader_t *reader,
+                                  const char *label)
+{
     FusionV2Frame_t frame;
-    if (!builder(&frame)) {
+    if (!BuildEnd(&frame)) {
         printf("SvProbe: build %s failed\n", label);
         return false;
     }
-    if (!SendFrame(cfg, label, &frame)) {
-        return false;
+
+    for (uint8_t attempt = 0u; attempt < kProbeEndSessionAttempts; ++attempt) {
+        if (attempt != 0u) {
+            (void)DrainUartRxForMs(kProbePostCleanupDrainMs);
+            ReaderReset(reader);
+        }
+        if (!SendFrame(cfg, label, &frame)) {
+            return false;
+        }
+        if (WaitEndSessionAck(reader, label, kProbeCleanupAckMs)) {
+            return true;
+        }
     }
-    const bool ok = ExpectCtl(cfg, reader, failure, NULL,
-                              (uint8_t)kFusionOp_AckAccepted,
-                              ack_for, label, 0u, 0u, 0u, t0);
-    if (final_end) {
-        failure->final_end_ack = ok;
-    }
-    return ok;
+    return false;
 }
 
 static bool ValidateHeader(const uint8_t *data)
@@ -635,8 +659,8 @@ static bool ValidateHeader(const uint8_t *data)
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P48G", 4u) != 0) {
-        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48G'\n",
+    if (memcmp(&data[12], "P48C", 4u) != 0) {
+        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48C'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }
@@ -1219,47 +1243,6 @@ static uint32_t DrainUartRxForMs(uint32_t duration_ms)
     return total;
 }
 
-static bool WaitPreflightCleanupAck(ProbeReader_t *reader,
-                                    ProbePreflight_t *preflight)
-{
-    const uint32_t bad_len0 = reader->bad_payload_len;
-    const uint32_t bad_crc0 = reader->bad_crc;
-    const uint32_t skipped0 = reader->skipped_non_marker;
-    const int64_t deadline = esp_timer_get_time()
-                           + ((int64_t)kProbeCleanupAckMs * 1000);
-
-    while (esp_timer_get_time() < deadline) {
-        FusionV2Decoded_t d;
-        const int64_t now = esp_timer_get_time();
-        const uint32_t remain_ms =
-            (uint32_t)((deadline > now) ? ((deadline - now + 999) / 1000) : 0);
-        if (remain_ms == 0u ||
-            !ReadDecodedFrameWithTimeout(reader,
-                                         "preflight END_SESSION cleanup",
-                                         remain_ms,
-                                         false,
-                                         &d)) {
-            break;
-        }
-
-        if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
-            d.ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
-            d.ack_for_opcode == (uint8_t)kFusionOp_EndSession) {
-            preflight->cleanup_ack = true;
-            break;
-        }
-
-        preflight->stale_frames_during_cleanup++;
-    }
-
-    preflight->bad_payload_len = reader->bad_payload_len - bad_len0;
-    preflight->bad_crc = reader->bad_crc - bad_crc0;
-    preflight->skipped_non_marker = reader->skipped_non_marker - skipped0;
-    return preflight->cleanup_ack &&
-           preflight->bad_payload_len == 0u &&
-           preflight->bad_crc == 0u;
-}
-
 static void PrintPreflight(const ProbePreflight_t *preflight)
 {
     printf("SvProbe: PREFLIGHT owner_acquired=%s normal_tasks_paused=%s "
@@ -1303,13 +1286,15 @@ static bool RunPreflight(const ProbeConfig_t *cfg,
     preflight->initial_drain_bytes = DrainUartRxForMs(kProbePreflightDrainMs);
     ReaderReset(reader);
 
-    FusionV2Frame_t end;
-    if (!BuildEnd(&end) || !SendFrame(cfg, "PREFLIGHT END_SESSION", &end)) {
-        PrintPreflight(preflight);
-        return false;
-    }
-
-    const bool cleanup_ok = WaitPreflightCleanupAck(reader, preflight);
+    const uint32_t bad_len0 = reader->bad_payload_len;
+    const uint32_t bad_crc0 = reader->bad_crc;
+    const uint32_t skipped0 = reader->skipped_non_marker;
+    const bool cleanup_ok =
+        SendEndSessionCleanup(cfg, reader, "PREFLIGHT END_SESSION");
+    preflight->cleanup_ack = cleanup_ok;
+    preflight->bad_payload_len = reader->bad_payload_len - bad_len0;
+    preflight->bad_crc = reader->bad_crc - bad_crc0;
+    preflight->skipped_non_marker = reader->skipped_non_marker - skipped0;
     preflight->post_cleanup_drain_bytes =
         DrainUartRxForMs(kProbePostCleanupDrainMs);
     ReaderReset(reader);
@@ -1390,12 +1375,8 @@ static bool RunProbe(const ProbeConfig_t *cfg)
     if (preflight.owner_acquired) {
         printf("SvProbe: sending END_SESSION cleanup\n");
         vTaskDelay(pdMS_TO_TICKS(kProbeFinalEndMs));
-        cleanup_ok =
-            SendCtlAndExpectAck(cfg, &reader, &failure,
-                                "END_SESSION cleanup",
-                                BuildEnd,
-                                (uint8_t)kFusionOp_EndSession,
-                                true);
+        cleanup_ok = SendEndSessionCleanup(cfg, &reader, "END_SESSION cleanup");
+        failure.final_end_ack = cleanup_ok;
         ok = ok && cleanup_ok;
     }
 
