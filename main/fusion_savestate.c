@@ -144,6 +144,12 @@ bool FusionSavestate_BuildBeginLoad(uint8_t flags, FusionV2Frame_t *out)
     return BuildCtl(p, sizeof(p), out);
 }
 
+bool FusionSavestate_BuildBeginTestRW(uint8_t flags, FusionV2Frame_t *out)
+{
+    const uint8_t p[2] = { (uint8_t)kFusionOp_BeginTestRW, flags };
+    return BuildCtl(p, sizeof(p), out);
+}
+
 bool FusionSavestate_BuildEndSession(FusionV2Frame_t *out)
 {
     const uint8_t p[1] = { (uint8_t)kFusionOp_EndSession };

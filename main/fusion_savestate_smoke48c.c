@@ -23,46 +23,39 @@
 #include <string.h>
 
 /*
- * Phase 4.8c — RAM-only round-trip smoke harness.
+ * Phase 4.8c v2 — strict bit-exact RAM-only round-trip smoke harness.
  *
- * The user's preferred topology is one continuous BEGIN_SAVE session that
- * also accepts writes (single-session round trip).  Implementing that
- * required widening the FPGA bridge's SESS_SAVING handlers to accept
- * OP_WRITE_STREAM_BEGIN / OP_WRITE_COMMIT and STATE_DATA in the
- * write-direction, and that change re-triggered the Gowin V1.9.9.03
- * "Running inference" syn-time hang previously seen in the Phase 4.8
- * Stage 1 attempt (project-wiki/20_data/fusion-savestate-phase4-8-redesign-handoff.md
- * §"Stage 1 Attempt — Why It Failed").  See also EVIDENCE.md in
- * .codex_tmp/phase4_8c_ram_roundtrip/.
+ * One continuous paused session.  After OP_BEGIN_TEST_RW is accepted,
+ * `session_pause` stays asserted until the final END_SESSION, so the
+ * GB CPU never runs between any harness write and any subsequent
+ * readback.  The bridge change that enables this lives in
+ * `state_port_uart_bridge.sv` and uses the predicates
+ * `sess_can_read_stream` / `sess_can_write_stream` to gate
+ * READ_STREAM_* / WRITE_STREAM_* opcodes during the mixed session.
  *
- * Until that pathology is unblocked the FPGA bridge stays at the P48C
- * baseline, which gates STR_READ on SESS_SAVING and STR_WRITE on
- * SESS_LOADING.  The round trip therefore runs as five back-to-back
- * sessions:
+ * Sequence (no flash writes, no hotkeys, no Top/CPU/Timer restore):
+ *   BEGIN_TEST_RW
+ *     R1: read original HRAM/WRAM into MCU RAM
+ *     W1: write XOR-pattern temp HRAM/WRAM
+ *     R2: re-read temp HRAM/WRAM and bit-exact compare
+ *     W2: write original HRAM/WRAM back (restore)
+ *     R3: re-read original HRAM/WRAM and bit-exact compare
+ *   END_SESSION
  *
- *   A: BEGIN_SAVE  -> read original HRAM/WRAM
- *   B: BEGIN_LOAD  -> write XOR-pattern temp HRAM/WRAM
- *   C: BEGIN_SAVE  -> read back temp, compare to expected
- *   D: BEGIN_LOAD  -> write original HRAM/WRAM (best-effort restore)
- *   E: BEGIN_SAVE  -> read back original, compare to expected
+ * The strict 4.8c PASS bar:
+ *   - temp HRAM readback exact;
+ *   - temp WRAM readback exact;
+ *   - restored HRAM readback exact;
+ *   - restored WRAM readback exact;
+ *   - END_SESSION cleanup ACK;
+ *   - persistent slot still valid (gen unchanged);
+ *   - user-visible core/game recovery cleanly verified after END_SESSION.
  *
- * `session_pause` drops between each END_SESSION and the next BEGIN_*,
- * so the GB core can run for the duration of that gap and mutate RAM.
- * Per the user's instruction "If any release is unavoidable, log it
- * explicitly and do not attribute mismatch to CPU activity without
- * evidence", this harness:
- *   - logs the END->BEGIN gap duration in microseconds for every
- *     session transition;
- *   - logs the first 16 mismatching offsets + bytes for any failed
- *     compare;
- *   - records a per-step first-failure record on any protocol error;
- *   - drains UART RX after each BEGIN ACK and after each session close,
- *     and reports drained byte counts.
- *
- * The 4.8c PASS bar remains bit-exact temp readback AND bit-exact
- * restored readback, slot intact, core released.  Multi-session can
- * only meet that bar on a quiescent ROM state — the harness reports
- * the actual hardware result either way.
+ * The harness emits a per-byte mismatch preview (up to 16 offsets) on
+ * any failed compare and records the first protocol failure.  Pre/post
+ * slot validation is read-only.  If OP_BEGIN_TEST_RW is rejected with
+ * ERR_NO_SESSION the bridge is the older P48C bitstream; flash a P48D
+ * (or newer) bitstream before retrying.
  */
 
 enum {
@@ -95,13 +88,17 @@ static const uint8_t kXorPattern[32] = {
 
 typedef struct {
     bool slot_valid_pre;
-    bool sess_a_ok;
-    bool sess_b_ok;
-    bool sess_c_ok;
-    bool sess_d_ok;
-    bool sess_e_ok;
+    /* Phase tracking for the single mixed paused session.  All phases
+     * happen within ONE BEGIN_TEST_RW / END_SESSION pair. */
+    bool begin_ok;            /* OP_BEGIN_TEST_RW accepted */
+    bool phase_r1_ok;         /* read original HRAM + WRAM */
+    bool phase_w1_ok;         /* write temp HRAM + WRAM */
+    bool phase_r2_ok;         /* read back temp HRAM + WRAM */
+    bool phase_w2_ok;         /* write original HRAM + WRAM */
+    bool phase_r3_ok;         /* read back original HRAM + WRAM */
+    bool end_ok;              /* END_SESSION acked inside the session */
     bool slot_valid_post;
-    bool core_released;
+    bool core_released;       /* final cleanup END_SESSION ACK observed */
     bool restore_attempted;
     bool restore_verified;
 
@@ -126,11 +123,9 @@ typedef struct {
     uint32_t generation_pre;
     uint32_t generation_post;
 
-    /* Gap timing: microseconds spent unpaused at each session boundary. */
-    int64_t gap_a_to_b_us;
-    int64_t gap_b_to_c_us;
-    int64_t gap_c_to_d_us;
-    int64_t gap_d_to_e_us;
+    /* Total elapsed time of the paused session window (BEGIN_TEST_RW
+     * ACK -> END_SESSION ACK).  Diagnostic only; not a pass criterion. */
+    int64_t  paused_session_us;
 
     /* First-failure forensics. */
     char     fail_step[24];
@@ -155,9 +150,9 @@ static uint8_t s_uart_cache[512];
 static size_t  s_uart_cache_pos = 0u;
 static size_t  s_uart_cache_len = 0u;
 
-/* Time at which the most recent END_SESSION ACK was observed. Used to
- * measure the unpaused gap until the next BEGIN_* ACK. */
-static int64_t s_last_end_us = 0;
+/* Timestamp of the BEGIN_TEST_RW ACK so we can report total paused
+ * session duration from the diagnostic side. */
+static int64_t s_session_open_us = 0;
 
 static void ResetUartCache(void)
 {
@@ -382,9 +377,7 @@ static bool IsEndSessionAck(const FusionV2Decoded_t *d)
            d->ack_for_opcode == (uint8_t)kFusionOp_EndSession;
 }
 
-static bool SendEndSessionRetry(const char *label,
-                                const char *step_label,
-                                bool record_end_us)
+static bool SendEndSessionRetry(const char *label, const char *step_label)
 {
     FusionV2Frame_t frame;
     if (!BuildEnd(&frame)) {
@@ -406,9 +399,6 @@ static bool SendEndSessionRetry(const char *label,
         }
         FusionV2Decoded_t d;
         if (ReadDecodedFrame(label, &d) && IsEndSessionAck(&d)) {
-            if (record_end_us) {
-                s_last_end_us = esp_timer_get_time();
-            }
             return true;
         }
     }
@@ -420,33 +410,25 @@ static bool SendEndSessionRetry(const char *label,
 }
 
 /*
- * Open a session.  Drains any prior bytes, sends an idempotent
- * END_SESSION clear, then BEGIN_SAVE or BEGIN_LOAD, then drains stale
- * bytes after the BEGIN ACK before the caller starts the next op.
+ * Open the single mixed paused session.  Drains any prior bytes, sends
+ * an idempotent END_SESSION clear in case a stale session is open, then
+ * BEGIN_TEST_RW.  After the ACK, drains residue and records the open
+ * timestamp so PrintResult can report total paused session duration.
  *
- * If `gap_record` is non-NULL and `s_last_end_us != 0`, records the
- * elapsed microseconds since the previous session-close ACK as the
- * unpaused gap window in which the GB core was free to mutate RAM.
+ * Distinguishes "old bridge" (BEGIN_TEST_RW rejected with ERR_NO_SESSION
+ * by the SESS_NONE default arm of a P48C bridge) from a real protocol
+ * failure: in the former case the harness reports the firmware mismatch
+ * and aborts cleanly so the maintainer can flash the P48D bitstream.
  */
-static bool OpenSession(bool load,
-                        const char *phase_label,
-                        int64_t *gap_record_us)
+static bool OpenMixedSession(void)
 {
-    char clear_label[40];
-    char begin_label[40];
-    snprintf(clear_label, sizeof(clear_label),
-             "END_SESSION clear (%s)", phase_label);
-    snprintf(begin_label, sizeof(begin_label),
-             "%s (%s)", load ? "BEGIN_LOAD" : "BEGIN_SAVE", phase_label);
-
     DrainRxForMs(kSmoke48cPreflightDrainMs);
     FPGA_Rx_ResetParser();
     ResetUartCache();
 
-    char clear_step[32];
-    snprintf(clear_step, sizeof(clear_step), "%s_clear", phase_label);
-    if (!SendEndSessionRetry(clear_label, clear_step, /*record_end_us=*/false)) {
-        printf("Smoke48c: %s clear failed\n", phase_label);
+    if (!SendEndSessionRetry("END_SESSION clear (mixed)",
+                             "mixed_clear")) {
+        printf("Smoke48c: mixed-session clear failed\n");
         return false;
     }
     DrainRxForMs(kSmoke48cPreflightDrainMs);
@@ -454,37 +436,54 @@ static bool OpenSession(bool load,
     ResetUartCache();
 
     FusionV2Frame_t begin;
-    bool ok = load ? FusionSavestate_BuildBeginLoad(0u, &begin)
-                   : FusionSavestate_BuildBeginSave(0u, &begin);
-    if (!ok) {
-        printf("Smoke48c: build %s failed\n", begin_label);
+    if (!FusionSavestate_BuildBeginTestRW(0u, &begin)) {
+        printf("Smoke48c: build BEGIN_TEST_RW failed\n");
         return false;
     }
-    if (!SendFrame(begin_label, &begin, /*quiet=*/false)) {
-        return false;
-    }
-    char begin_step[32];
-    snprintf(begin_step, sizeof(begin_step), "%s_begin", phase_label);
-    const uint8_t expect_for = load ? (uint8_t)kFusionOp_BeginLoad
-                                    : (uint8_t)kFusionOp_BeginSave;
-    if (!ExpectCtl((uint8_t)kFusionOp_AckAccepted, expect_for, begin_label,
-                   begin_step, -1)) {
+    if (!SendFrame("BEGIN_TEST_RW (mixed)", &begin, /*quiet=*/false)) {
         return false;
     }
 
-    /* Capture the unpaused gap window for evidence. */
-    const int64_t now = esp_timer_get_time();
-    if (gap_record_us != NULL && s_last_end_us != 0) {
-        *gap_record_us = now - s_last_end_us;
-        printf("Smoke48c: GAP %s unpaused_us=%" PRId64 "\n",
-               phase_label, *gap_record_us);
+    FusionV2Decoded_t d;
+    if (!ReadDecodedFrame("BEGIN_TEST_RW ack", &d)) {
+        RecordFirstFailure("mixed_begin",
+                           "rx_timeout_for_begin_ack",
+                           -1, -1, -1, 0u, 0u);
+        return false;
+    }
+    if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
+        d.ctl_opcode == (uint8_t)kFusionOp_Error) {
+        printf("Smoke48c: BEGIN_TEST_RW FPGA ERROR code=0x%02X detail=0x%02X "
+               "(if code=0x03 the bridge is older P48C; flash a P48D bitstream "
+               "with OP_BEGIN_TEST_RW support)\n",
+               d.error_code, d.error_detail);
+        char reason[64];
+        snprintf(reason, sizeof(reason),
+                 "begin_test_rw_error_code=0x%02X_detail=0x%02X",
+                 d.error_code, d.error_detail);
+        RecordFirstFailure("mixed_begin", reason, -1, -1, -1, 0u, 0u);
+        return false;
+    }
+    if (!(d.addr == (uint8_t)kFusionAddr_StateCtl &&
+          d.ctl_opcode == (uint8_t)kFusionOp_AckAccepted &&
+          d.ack_for_opcode == (uint8_t)kFusionOp_BeginTestRW)) {
+        printf("Smoke48c: BEGIN_TEST_RW unexpected reply addr=0x%02X "
+               "op=0x%02X ack_for=0x%02X\n",
+               d.addr, d.ctl_opcode, d.ack_for_opcode);
+        char reason[64];
+        snprintf(reason, sizeof(reason),
+                 "unexpected_ctl_op=0x%02X_ack_for=0x%02X",
+                 d.ctl_opcode, d.ack_for_opcode);
+        RecordFirstFailure("mixed_begin", reason, -1, -1, -1, 0u, 0u);
+        return false;
     }
 
-    /* Post-BEGIN drain to clear residue before the next stream op. */
+    s_session_open_us = esp_timer_get_time();
+
     const uint32_t drained = DrainRxForMsCounted(kSmoke48cPostBeginDrainMs);
     if (drained != 0u) {
-        printf("Smoke48c: %s post-BEGIN drained %" PRIu32 " stale bytes\n",
-               phase_label, drained);
+        printf("Smoke48c: mixed post-BEGIN drained %" PRIu32 " stale bytes\n",
+               drained);
     }
     FPGA_Rx_ResetParser();
     ResetUartCache();
@@ -492,17 +491,12 @@ static bool OpenSession(bool load,
     return true;
 }
 
-static bool CloseSession(const char *phase_label)
+static bool CloseMixedSession(void)
 {
-    char cleanup_label[40];
-    snprintf(cleanup_label, sizeof(cleanup_label),
-             "END_SESSION cleanup (%s)", phase_label);
     DrainRxForMs(kSmoke48cFinalEndMs);
     ResetUartCache();
-    char cleanup_step[32];
-    snprintf(cleanup_step, sizeof(cleanup_step), "%s_cleanup", phase_label);
-    return SendEndSessionRetry(cleanup_label, cleanup_step,
-                               /*record_end_us=*/true);
+    return SendEndSessionRetry("END_SESSION cleanup (mixed)",
+                               "mixed_cleanup");
 }
 
 static bool ReadRegionStream(uint8_t region,
@@ -801,11 +795,14 @@ static bool ValidateSlotQuiet(uint32_t *generation_out, const char *moment)
                moment, (int)sr);
         return false;
     }
+    const bool tag_ok =
+        (memcmp(hdr.savestate_tag, "P48C", 4u) == 0) ||
+        (memcmp(hdr.savestate_tag, "P48D", 4u) == 0);
     if (hdr.magic != FUSION_SAVESTATE_MAGIC ||
         hdr.format_version != FUSION_SAVESTATE_FORMAT_VERSION ||
         hdr.header_size != sizeof(FusionStateHeader_t) ||
         hdr.commit_state != (uint8_t)kFusionCommit_Valid ||
-        memcmp(hdr.savestate_tag, SMOKE48C_SLOT_TAG, 4u) != 0) {
+        !tag_ok) {
         printf("Smoke48c: SLOT_%s header rejected magic=%08" PRIX32
                " state=0x%02X tag='%c%c%c%c'\n",
                moment, hdr.magic, hdr.commit_state,
@@ -852,15 +849,17 @@ static void FreeBuffers(void)
 static void PrintResult(bool overall_pass)
 {
     const Smoke48cResult_t *r = &s_result;
-    printf("Smoke48c: STATUS slot_pre=%s sess_a=%s sess_b=%s sess_c=%s "
-           "sess_d=%s sess_e=%s slot_post=%s core_released=%s "
+    printf("Smoke48c: STATUS slot_pre=%s begin=%s r1=%s w1=%s r2=%s w2=%s "
+           "r3=%s end=%s slot_post=%s core_released=%s "
            "restore_attempted=%s restore_verified=%s\n",
            r->slot_valid_pre ? "yes" : "no",
-           r->sess_a_ok ? "yes" : "no",
-           r->sess_b_ok ? "yes" : "no",
-           r->sess_c_ok ? "yes" : "no",
-           r->sess_d_ok ? "yes" : "no",
-           r->sess_e_ok ? "yes" : "no",
+           r->begin_ok ? "yes" : "no",
+           r->phase_r1_ok ? "yes" : "no",
+           r->phase_w1_ok ? "yes" : "no",
+           r->phase_r2_ok ? "yes" : "no",
+           r->phase_w2_ok ? "yes" : "no",
+           r->phase_r3_ok ? "yes" : "no",
+           r->end_ok ? "yes" : "no",
            r->slot_valid_post ? "yes" : "no",
            r->core_released ? "yes" : "no",
            r->restore_attempted ? "yes" : "no",
@@ -883,10 +882,8 @@ static void PrintResult(bool overall_pass)
            r->mismatch_temp_wram, r->first_mismatch_temp_wram,
            r->mismatch_orig_hram, r->first_mismatch_orig_hram,
            r->mismatch_orig_wram, r->first_mismatch_orig_wram);
-    printf("Smoke48c: GAPS_us a_to_b=%" PRId64 " b_to_c=%" PRId64
-           " c_to_d=%" PRId64 " d_to_e=%" PRId64 "\n",
-           r->gap_a_to_b_us, r->gap_b_to_c_us,
-           r->gap_c_to_d_us, r->gap_d_to_e_us);
+    printf("Smoke48c: PAUSED_SESSION_us=%" PRId64 "\n",
+           r->paused_session_us);
     printf("Smoke48c: SLOT_GEN pre=%" PRIu32 " post=%" PRIu32 "\n",
            r->generation_pre, r->generation_post);
     if (r->fail_step[0] != '\0') {
@@ -899,9 +896,56 @@ static void PrintResult(bool overall_pass)
                r->fail_bytes_so_far, r->fail_packets_so_far,
                r->fail_drained_bytes);
     }
-    printf("Smoke48c: RESULT %s (4.8c RAM-only round-trip; multi-session; "
-           "Top/CPU/Timer restore not exercised; no hotkey)\n",
+    printf("Smoke48c: RESULT %s (4.8c v2 RAM-only round-trip; one paused "
+           "session; Top/CPU/Timer restore not exercised; no hotkey)\n",
            overall_pass ? "PASS" : "FAIL");
+}
+
+static void CompareTempWram(const uint8_t *orig_wram,
+                            const uint8_t *readback)
+{
+    /* WRAM expected = orig XOR kXorPattern.  Re-derived on the fly to
+     * avoid a second 32 KiB allocation; this is a hot loop in the
+     * single-session run so the bookkeeping stays tight. */
+    uint32_t cnt = 0u;
+    int32_t  first = -1;
+    int32_t  preview_offsets[kSmoke48cMismatchPreviewCount] = {0};
+    uint8_t  preview_expected[kSmoke48cMismatchPreviewCount] = {0};
+    uint8_t  preview_actual[kSmoke48cMismatchPreviewCount] = {0};
+    uint8_t  preview_count = 0u;
+    for (size_t i = 0; i < SMOKE48C_WRAM_LEN; ++i) {
+        const uint8_t expected =
+            (uint8_t)(orig_wram[i] ^ kXorPattern[i & 0x1Fu]);
+        if (expected != readback[i]) {
+            if (first < 0) first = (int32_t)i;
+            if (preview_count < kSmoke48cMismatchPreviewCount) {
+                preview_offsets[preview_count] = (int32_t)i;
+                preview_expected[preview_count] = expected;
+                preview_actual[preview_count] = readback[i];
+                preview_count++;
+            }
+            cnt++;
+        }
+    }
+    s_result.mismatch_temp_wram = cnt;
+    s_result.first_mismatch_temp_wram = first;
+    if (cnt == 0u) {
+        printf("Smoke48c: COMPARE temp_wram match=exact len=%u\n",
+               (unsigned)SMOKE48C_WRAM_LEN);
+        return;
+    }
+    const uint8_t expected =
+        (uint8_t)(orig_wram[first] ^ kXorPattern[first & 0x1F]);
+    printf("Smoke48c: COMPARE temp_wram match=fail len=%u mismatches=%u "
+           "first_offset=%" PRId32 " expected=%02X actual=%02X\n",
+           (unsigned)SMOKE48C_WRAM_LEN, (unsigned)cnt, first,
+           expected, readback[first]);
+    printf("Smoke48c: COMPARE temp_wram preview");
+    for (uint8_t i = 0; i < preview_count; ++i) {
+        printf(" [%" PRId32 ":%02X->%02X]",
+               preview_offsets[i], preview_expected[i], preview_actual[i]);
+    }
+    printf("\n");
 }
 
 bool FusionSavestate_RamRoundTripSlot0(void)
@@ -914,7 +958,7 @@ bool FusionSavestate_RamRoundTripSlot0(void)
     s_result.fail_region = -1;
     s_result.fail_expected_seq = -1;
     s_result.fail_got_seq = -1;
-    s_last_end_us = 0;
+    s_session_open_us = 0;
 
     if (!AllocBuffers()) {
         PrintResult(false);
@@ -951,192 +995,159 @@ bool FusionSavestate_RamRoundTripSlot0(void)
         return false;
     }
 
-    /* Phase A: SAVE — read original RAM. */
-    if (OpenSession(/*load=*/false, "A_save", NULL)) {
-        if (ReadRegionStream(SMOKE48C_HRAM_REGION, SMOKE48C_HRAM_LEN,
-                             s_orig_hram, "HRAM", "A",
-                             "read_orig_hram") &&
-            ReadRegionStream(SMOKE48C_WRAM_REGION, SMOKE48C_WRAM_LEN,
-                             s_orig_wram, "WRAM", "A",
-                             "read_orig_wram")) {
-            s_result.sess_a_ok = CloseSession("A_save");
-        } else {
-            (void)CloseSession("A_save");
-        }
-    }
+    /*
+     * Single mixed paused session.  Inside this BEGIN_TEST_RW /
+     * END_SESSION pair, session_pause stays asserted continuously and
+     * the GB CPU never executes, so RAM cannot drift between any
+     * harness write and its readback.  All five phases (R1, W1, R2,
+     * W2, R3) run inline below.  No END_SESSION is sent until the
+     * very end.
+     */
+    if (OpenMixedSession()) {
+        s_result.begin_ok = true;
 
-    if (s_result.sess_a_ok) {
-        s_result.crc_orig_hram =
-            FusionSavestate_Crc32(s_orig_hram, SMOKE48C_HRAM_LEN);
-        s_result.crc_orig_wram =
-            FusionSavestate_Crc32(s_orig_wram, SMOKE48C_WRAM_LEN);
-        ApplyXorPattern(s_orig_hram, s_scratch_hram, SMOKE48C_HRAM_LEN);
-        ApplyXorPattern(s_orig_wram, s_scratch_wram, SMOKE48C_WRAM_LEN);
-        s_result.crc_temp_hram =
-            FusionSavestate_Crc32(s_scratch_hram, SMOKE48C_HRAM_LEN);
-        s_result.crc_temp_wram =
-            FusionSavestate_Crc32(s_scratch_wram, SMOKE48C_WRAM_LEN);
-        printf("Smoke48c: PHASE A complete: orig_hram=%08" PRIX32
-               " orig_wram=%08" PRIX32 " temp_hram=%08" PRIX32
-               " temp_wram=%08" PRIX32 "\n",
-               s_result.crc_orig_hram, s_result.crc_orig_wram,
-               s_result.crc_temp_hram, s_result.crc_temp_wram);
+        /* R1: read original HRAM and WRAM. */
+        const bool r1_h = ReadRegionStream(SMOKE48C_HRAM_REGION,
+                                           SMOKE48C_HRAM_LEN,
+                                           s_orig_hram, "HRAM", "R1",
+                                           "read_orig_hram");
+        const bool r1_w = r1_h && ReadRegionStream(SMOKE48C_WRAM_REGION,
+                                                   SMOKE48C_WRAM_LEN,
+                                                   s_orig_wram, "WRAM", "R1",
+                                                   "read_orig_wram");
+        s_result.phase_r1_ok = r1_h && r1_w;
 
-        /* Phase B: LOAD — write XOR-pattern temp. */
-        if (OpenSession(/*load=*/true, "B_load_temp", &s_result.gap_a_to_b_us)) {
-            const bool wh =
-                WriteRegionStream(SMOKE48C_HRAM_REGION, SMOKE48C_HRAM_LEN,
-                                  s_scratch_hram, "HRAM", "B",
-                                  "write_temp_hram");
-            const bool ww = wh && WriteRegionStream(SMOKE48C_WRAM_REGION,
-                                                    SMOKE48C_WRAM_LEN,
-                                                    s_scratch_wram,
-                                                    "WRAM", "B",
-                                                    "write_temp_wram");
-            const bool close_ok = CloseSession("B_load_temp");
-            s_result.sess_b_ok = wh && ww && close_ok;
-        }
+        if (s_result.phase_r1_ok) {
+            s_result.crc_orig_hram =
+                FusionSavestate_Crc32(s_orig_hram, SMOKE48C_HRAM_LEN);
+            s_result.crc_orig_wram =
+                FusionSavestate_Crc32(s_orig_wram, SMOKE48C_WRAM_LEN);
+            ApplyXorPattern(s_orig_hram, s_scratch_hram, SMOKE48C_HRAM_LEN);
+            ApplyXorPattern(s_orig_wram, s_scratch_wram, SMOKE48C_WRAM_LEN);
+            s_result.crc_temp_hram =
+                FusionSavestate_Crc32(s_scratch_hram, SMOKE48C_HRAM_LEN);
+            s_result.crc_temp_wram =
+                FusionSavestate_Crc32(s_scratch_wram, SMOKE48C_WRAM_LEN);
+            printf("Smoke48c: PHASE R1 complete: orig_hram=%08" PRIX32
+                   " orig_wram=%08" PRIX32 " temp_hram=%08" PRIX32
+                   " temp_wram=%08" PRIX32 "\n",
+                   s_result.crc_orig_hram, s_result.crc_orig_wram,
+                   s_result.crc_temp_hram, s_result.crc_temp_wram);
 
-        if (s_result.sess_b_ok) {
-            uint8_t saved_temp_hram[SMOKE48C_HRAM_LEN];
-            memcpy(saved_temp_hram, s_scratch_hram, SMOKE48C_HRAM_LEN);
+            /* W1: write XOR-pattern temp into HRAM and WRAM. */
+            const bool w1_h = WriteRegionStream(SMOKE48C_HRAM_REGION,
+                                                SMOKE48C_HRAM_LEN,
+                                                s_scratch_hram, "HRAM", "W1",
+                                                "write_temp_hram");
+            const bool w1_w = w1_h && WriteRegionStream(SMOKE48C_WRAM_REGION,
+                                                        SMOKE48C_WRAM_LEN,
+                                                        s_scratch_wram,
+                                                        "WRAM", "W1",
+                                                        "write_temp_wram");
+            s_result.phase_w1_ok = w1_h && w1_w;
 
-            /* Phase C: SAVE — read back temp, compare against expected. */
-            if (OpenSession(/*load=*/false, "C_save_verify_temp",
-                            &s_result.gap_b_to_c_us)) {
-                const bool rh =
-                    ReadRegionStream(SMOKE48C_HRAM_REGION, SMOKE48C_HRAM_LEN,
-                                     s_scratch_hram, "HRAM", "C",
-                                     "read_back_temp_hram");
-                const bool rw = rh && ReadRegionStream(SMOKE48C_WRAM_REGION,
-                                                       SMOKE48C_WRAM_LEN,
-                                                       s_scratch_wram,
-                                                       "WRAM", "C",
-                                                       "read_back_temp_wram");
-                const bool close_ok = CloseSession("C_save_verify_temp");
-                s_result.sess_c_ok = rh && rw && close_ok;
+            if (s_result.phase_w1_ok) {
+                /* R2: re-read temp; bit-exact compare. */
+                uint8_t saved_temp_hram[SMOKE48C_HRAM_LEN];
+                memcpy(saved_temp_hram, s_scratch_hram, SMOKE48C_HRAM_LEN);
 
-                if (rh) {
+                const bool r2_h = ReadRegionStream(SMOKE48C_HRAM_REGION,
+                                                   SMOKE48C_HRAM_LEN,
+                                                   s_scratch_hram, "HRAM", "R2",
+                                                   "read_back_temp_hram");
+                const bool r2_w = r2_h && ReadRegionStream(SMOKE48C_WRAM_REGION,
+                                                           SMOKE48C_WRAM_LEN,
+                                                           s_scratch_wram,
+                                                           "WRAM", "R2",
+                                                           "read_back_temp_wram");
+                s_result.phase_r2_ok = r2_h && r2_w;
+                if (r2_h) {
                     s_result.crc_readback_temp_hram =
-                        FusionSavestate_Crc32(s_scratch_hram, SMOKE48C_HRAM_LEN);
+                        FusionSavestate_Crc32(s_scratch_hram,
+                                              SMOKE48C_HRAM_LEN);
                     CompareAndPreview("temp_hram",
                                       saved_temp_hram, s_scratch_hram,
                                       SMOKE48C_HRAM_LEN,
                                       &s_result.mismatch_temp_hram,
                                       &s_result.first_mismatch_temp_hram);
                 }
-                if (rw) {
+                if (r2_w) {
                     s_result.crc_readback_temp_wram =
-                        FusionSavestate_Crc32(s_scratch_wram, SMOKE48C_WRAM_LEN);
-                    /* Compare WRAM via on-the-fly XOR of orig — avoids a
-                     * second 32 KiB allocation. */
-                    uint32_t cnt = 0u;
-                    int32_t first = -1;
-                    int32_t  preview_offsets[kSmoke48cMismatchPreviewCount] = {0};
-                    uint8_t  preview_expected[kSmoke48cMismatchPreviewCount] = {0};
-                    uint8_t  preview_actual[kSmoke48cMismatchPreviewCount] = {0};
-                    uint8_t  preview_count = 0u;
-                    for (size_t i = 0; i < SMOKE48C_WRAM_LEN; ++i) {
-                        const uint8_t expected =
-                            (uint8_t)(s_orig_wram[i] ^ kXorPattern[i & 0x1Fu]);
-                        if (expected != s_scratch_wram[i]) {
-                            if (first < 0) first = (int32_t)i;
-                            if (preview_count < kSmoke48cMismatchPreviewCount) {
-                                preview_offsets[preview_count] = (int32_t)i;
-                                preview_expected[preview_count] = expected;
-                                preview_actual[preview_count] = s_scratch_wram[i];
-                                preview_count++;
-                            }
-                            cnt++;
+                        FusionSavestate_Crc32(s_scratch_wram,
+                                              SMOKE48C_WRAM_LEN);
+                    CompareTempWram(s_orig_wram, s_scratch_wram);
+                }
+
+                /* W2: write originals back (best-effort restore). */
+                if (s_result.phase_r2_ok) {
+                    s_result.restore_attempted = true;
+                    const bool w2_h = WriteRegionStream(SMOKE48C_HRAM_REGION,
+                                                        SMOKE48C_HRAM_LEN,
+                                                        s_orig_hram, "HRAM",
+                                                        "W2",
+                                                        "write_orig_hram");
+                    const bool w2_w = w2_h &&
+                                      WriteRegionStream(SMOKE48C_WRAM_REGION,
+                                                        SMOKE48C_WRAM_LEN,
+                                                        s_orig_wram, "WRAM",
+                                                        "W2",
+                                                        "write_orig_wram");
+                    s_result.phase_w2_ok = w2_h && w2_w;
+
+                    if (s_result.phase_w2_ok) {
+                        /* R3: re-read originals; bit-exact compare. */
+                        const bool r3_h =
+                            ReadRegionStream(SMOKE48C_HRAM_REGION,
+                                             SMOKE48C_HRAM_LEN,
+                                             s_scratch_hram, "HRAM", "R3",
+                                             "read_back_orig_hram");
+                        const bool r3_w = r3_h &&
+                            ReadRegionStream(SMOKE48C_WRAM_REGION,
+                                             SMOKE48C_WRAM_LEN,
+                                             s_scratch_wram, "WRAM", "R3",
+                                             "read_back_orig_wram");
+                        s_result.phase_r3_ok = r3_h && r3_w;
+                        if (r3_h) {
+                            s_result.crc_readback_orig_hram =
+                                FusionSavestate_Crc32(s_scratch_hram,
+                                                      SMOKE48C_HRAM_LEN);
+                            CompareAndPreview("orig_hram",
+                                              s_orig_hram, s_scratch_hram,
+                                              SMOKE48C_HRAM_LEN,
+                                              &s_result.mismatch_orig_hram,
+                                              &s_result.first_mismatch_orig_hram);
                         }
-                    }
-                    s_result.mismatch_temp_wram = cnt;
-                    s_result.first_mismatch_temp_wram = first;
-                    if (cnt == 0u) {
-                        printf("Smoke48c: COMPARE temp_wram match=exact len=%u\n",
-                               (unsigned)SMOKE48C_WRAM_LEN);
-                    } else {
-                        const uint8_t expected =
-                            (uint8_t)(s_orig_wram[first] ^ kXorPattern[first & 0x1F]);
-                        printf("Smoke48c: COMPARE temp_wram match=fail len=%u "
-                               "mismatches=%u first_offset=%" PRId32
-                               " expected=%02X actual=%02X\n",
-                               (unsigned)SMOKE48C_WRAM_LEN,
-                               (unsigned)cnt, first,
-                               expected, s_scratch_wram[first]);
-                        printf("Smoke48c: COMPARE temp_wram preview");
-                        for (uint8_t i = 0; i < preview_count; ++i) {
-                            printf(" [%" PRId32 ":%02X->%02X]",
-                                   preview_offsets[i], preview_expected[i],
-                                   preview_actual[i]);
+                        if (r3_w) {
+                            s_result.crc_readback_orig_wram =
+                                FusionSavestate_Crc32(s_scratch_wram,
+                                                      SMOKE48C_WRAM_LEN);
+                            CompareAndPreview("orig_wram",
+                                              s_orig_wram, s_scratch_wram,
+                                              SMOKE48C_WRAM_LEN,
+                                              &s_result.mismatch_orig_wram,
+                                              &s_result.first_mismatch_orig_wram);
+                            s_result.restore_verified =
+                                (s_result.mismatch_orig_hram == 0u) &&
+                                (s_result.mismatch_orig_wram == 0u);
                         }
-                        printf("\n");
                     }
                 }
             }
         }
-    }
 
-    /* Best-effort restore: write originals back. Always attempted if Phase
-     * A succeeded.  Brief: "Attempt one best-effort restore of original
-     * HRAM/WRAM, then stop and report exact state." */
-    if (s_result.sess_a_ok) {
-        s_result.restore_attempted = true;
-        if (OpenSession(/*load=*/true, "D_load_restore",
-                        &s_result.gap_c_to_d_us)) {
-            const bool wh =
-                WriteRegionStream(SMOKE48C_HRAM_REGION, SMOKE48C_HRAM_LEN,
-                                  s_orig_hram, "HRAM", "D",
-                                  "write_orig_hram");
-            const bool ww = wh && WriteRegionStream(SMOKE48C_WRAM_REGION,
-                                                    SMOKE48C_WRAM_LEN,
-                                                    s_orig_wram, "WRAM", "D",
-                                                    "write_orig_wram");
-            const bool close_ok = CloseSession("D_load_restore");
-            s_result.sess_d_ok = wh && ww && close_ok;
+        /* End the single mixed session.  This is the only END_SESSION
+         * inside the round-trip; session_pause drops here. */
+        s_result.end_ok = CloseMixedSession();
+        if (s_session_open_us != 0) {
+            s_result.paused_session_us =
+                esp_timer_get_time() - s_session_open_us;
+            printf("Smoke48c: PAUSED_SESSION dt_us=%" PRId64 "\n",
+                   s_result.paused_session_us);
         }
     }
 
-    if (s_result.sess_d_ok) {
-        if (OpenSession(/*load=*/false, "E_save_verify_orig",
-                        &s_result.gap_d_to_e_us)) {
-            const bool rh =
-                ReadRegionStream(SMOKE48C_HRAM_REGION, SMOKE48C_HRAM_LEN,
-                                 s_scratch_hram, "HRAM", "E",
-                                 "read_back_orig_hram");
-            const bool rw = rh && ReadRegionStream(SMOKE48C_WRAM_REGION,
-                                                   SMOKE48C_WRAM_LEN,
-                                                   s_scratch_wram,
-                                                   "WRAM", "E",
-                                                   "read_back_orig_wram");
-            const bool close_ok = CloseSession("E_save_verify_orig");
-            s_result.sess_e_ok = rh && rw && close_ok;
-
-            if (rh) {
-                s_result.crc_readback_orig_hram =
-                    FusionSavestate_Crc32(s_scratch_hram, SMOKE48C_HRAM_LEN);
-                CompareAndPreview("orig_hram",
-                                  s_orig_hram, s_scratch_hram,
-                                  SMOKE48C_HRAM_LEN,
-                                  &s_result.mismatch_orig_hram,
-                                  &s_result.first_mismatch_orig_hram);
-            }
-            if (rw) {
-                s_result.crc_readback_orig_wram =
-                    FusionSavestate_Crc32(s_scratch_wram, SMOKE48C_WRAM_LEN);
-                CompareAndPreview("orig_wram",
-                                  s_orig_wram, s_scratch_wram,
-                                  SMOKE48C_WRAM_LEN,
-                                  &s_result.mismatch_orig_wram,
-                                  &s_result.first_mismatch_orig_wram);
-                s_result.restore_verified =
-                    (s_result.mismatch_orig_hram == 0u) &&
-                    (s_result.mismatch_orig_wram == 0u);
-            }
-        }
-    }
-
-    /* Final cleanup: ensure session is fully closed and core released. */
+    /* Final cleanup: idempotent END_SESSION ack confirms the bridge is
+     * idle and the GB core is released. */
     {
         FusionV2Frame_t end_frame;
         if (BuildEnd(&end_frame)) {
@@ -1170,8 +1181,10 @@ bool FusionSavestate_RamRoundTripSlot0(void)
 
     const bool overall_pass =
         s_result.slot_valid_pre &&
-        s_result.sess_a_ok && s_result.sess_b_ok && s_result.sess_c_ok &&
-        s_result.sess_d_ok && s_result.sess_e_ok &&
+        s_result.begin_ok &&
+        s_result.phase_r1_ok && s_result.phase_w1_ok &&
+        s_result.phase_r2_ok && s_result.phase_w2_ok &&
+        s_result.phase_r3_ok && s_result.end_ok &&
         s_result.slot_valid_post && s_result.core_released &&
         s_result.restore_verified &&
         s_result.mismatch_temp_hram == 0u &&

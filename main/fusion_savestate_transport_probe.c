@@ -659,8 +659,9 @@ static bool ValidateHeader(const uint8_t *data)
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P48C", 4u) != 0) {
-        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48C'\n",
+    if (memcmp(&data[12], "P48C", 4u) != 0 &&
+        memcmp(&data[12], "P48D", 4u) != 0) {
+        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48C' or 'P48D'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }

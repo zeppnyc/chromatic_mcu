@@ -345,8 +345,12 @@ static bool ValidateHeaderEvidence(const uint8_t data[16],
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P48C", 4u) != 0) {
-        printf("Smoke48a: Header tag mismatch got='%c%c%c%c' want='P48C'\n",
+    if (memcmp(&data[12], "P48C", 4u) != 0 &&
+        memcmp(&data[12], "P48D", 4u) != 0) {
+        /* P48D is the in-flight 4.8c v2 mixed-session bitstream tag and
+         * is forward-compatible with this header check; the persistent
+         * slot itself still tags as whichever bitstream wrote it. */
+        printf("Smoke48a: Header tag mismatch got='%c%c%c%c' want='P48C' or 'P48D'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }
@@ -631,10 +635,13 @@ static bool ValidateSlot(FusionStorage_t *storage, Smoke48aResult_t *result)
                hdr.commit_state);
         return false;
     }
+    const bool tag_ok =
+        (memcmp(hdr.savestate_tag, "P48C", 4u) == 0) ||
+        (memcmp(hdr.savestate_tag, "P48D", 4u) == 0);
     if (hdr.total_size != ExpectedTotalSize() ||
         hdr.region_count != kSmoke48aRegionCount ||
         hdr.region_bitmap != kExpectedBitmap ||
-        memcmp(hdr.savestate_tag, "P48C", 4u) != 0) {
+        !tag_ok) {
         printf("Smoke48a: metadata mismatch total=%lu/%lu regions=%lu/%u "
                "bitmap=0x%08lX tag='%c%c%c%c'\n",
                (unsigned long)hdr.total_size,

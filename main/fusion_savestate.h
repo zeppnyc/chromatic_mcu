@@ -55,6 +55,14 @@ typedef enum {
     kFusionOp_WriteStreamBegin = 0x07u,
     kFusionOp_WriteCommit      = 0x08u,
     kFusionOp_ReadStreamContinue = 0x09u,
+    /*
+     * Phase 4.8c v2: mixed paused session.  The bridge keeps
+     * session_pause asserted from BEGIN_TEST_RW until END_SESSION and
+     * accepts both READ_STREAM_* and WRITE_STREAM_* in the same
+     * session.  Used only by the strict bit-exact RAM round-trip smoke
+     * harness; OP_BEGIN_SAVE / OP_BEGIN_LOAD semantics are unchanged.
+     */
+    kFusionOp_BeginTestRW      = 0x0Au,
     /* FPGA -> MCU */
     kFusionOp_AckAccepted      = 0x10u,
     kFusionOp_Busy             = 0x11u,
@@ -179,6 +187,7 @@ bool FusionSavestate_DecodeV2Frame(const uint8_t *frame,
 
 bool FusionSavestate_BuildBeginSave(uint8_t flags, FusionV2Frame_t *out);
 bool FusionSavestate_BuildBeginLoad(uint8_t flags, FusionV2Frame_t *out);
+bool FusionSavestate_BuildBeginTestRW(uint8_t flags, FusionV2Frame_t *out);
 bool FusionSavestate_BuildEndSession(FusionV2Frame_t *out);
 bool FusionSavestate_BuildSeek(uint8_t region, uint16_t offset, FusionV2Frame_t *out);
 bool FusionSavestate_BuildReadNext(uint8_t count, FusionV2Frame_t *out);
