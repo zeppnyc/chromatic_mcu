@@ -2,6 +2,7 @@
 
 #include "battery.h"
 #include "brightness.h"
+#include "button.h"  /* path-e (4.8d) chord detection */
 #include "color_correct_lcd.h"
 #include "color_correct_usb.h"
 #include "crc8_sae_j1850.h"
@@ -13,6 +14,7 @@
 #include "frameblend.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "fusion_savestate_smoke48a.h"  /* path-e: FusionSavestate_PostChordRequest */
 #include "fw.h"
 #include "osd.h"
 #include "pwrmgr.h"
@@ -95,7 +97,14 @@ void FPGA_RxTask(void *arg)
             portMAX_DELAY
         );
 
-        const int32_t ByteCount = uart_read_bytes(UART_NUM_1, pRxBuffer, sizeof(RxBuffer), pdMS_TO_TICKS(10));
+        int32_t ByteCount = 0;
+        if (FPGA_UartOwnerAcquire(pdMS_TO_TICKS(10))) {
+            ByteCount = uart_read_bytes(UART_NUM_1,
+                                        pRxBuffer,
+                                        sizeof(RxBuffer),
+                                        pdMS_TO_TICKS(10));
+            FPGA_UartOwnerRelease();
+        }
 
         if (ByteCount > 0)
         {
@@ -126,6 +135,13 @@ void FPGA_Rx_Resume(void)
 void FPGA_Rx_Pause(void)
 {
    (void) xEventGroupClearBits(xEventGroupHandle, kRxFlag_Resume);
+}
+
+void FPGA_Rx_ResetParser(void)
+{
+    _eState = kScanForHeaderMarker;
+    BufferIndex = 0;
+    memset(DecodeBuffer, 0x0, sizeof(DecodeBuffer));
 }
 
 void FPGA_Rx_UseBrightnessReadback(void)
@@ -301,6 +317,18 @@ static void ProcessMessage(const RxMsg_t *const pMsg)
         }
         case kRxCmd_Buttons:
             Button_Update(rxdata);
+            /*
+             * Path-e (4.8d) chord detection.  Fires Save/LoadRequested on
+             * MENU+DOWN / MENU+UP held for the chord threshold.  The actual
+             * save/load is dispatched via the savestate request queue —
+             * see main.c for the consumer task.
+             */
+            {
+                ButtonChordEvent_t chord = ButtonChord_Update(rxdata);
+                if (chord != kButtonChord_None) {
+                    FusionSavestate_PostChordRequest(chord);
+                }
+            }
             if ((rxdata & kButtonBits_MenuEnAlt) != 0 || (rxdata & kButtonBits_MenuEn) != 0)
             {
                 OSD_SetVisiblityState(false);

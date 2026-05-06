@@ -224,3 +224,122 @@ void Button_RegisterCommands(void)
         ESP_LOGE(TAG, "Registering '%s' command failed: %s", command.command, esp_err_to_name(err));
     }
 }
+
+/* ===== Path-e (4.8d) chord/hold detection ===== */
+
+typedef enum ChordTracked {
+    kChordTracked_None = 0,
+    kChordTracked_Save,  /* MENU + DOWN */
+    kChordTracked_Load,  /* MENU + UP   */
+} ChordTracked_t;
+
+typedef struct ChordState {
+    ChordTracked_t  current;        /* chord currently being tracked */
+    uint16_t        hold_count;     /* consecutive matching ticks */
+    bool            consumed;       /* fired; awaiting release before re-arm */
+    uint16_t        hold_threshold; /* ticks required to fire */
+} ChordState_t;
+
+static ChordState_t _Chord = {
+    .current        = kChordTracked_None,
+    .hold_count     = 0u,
+    .consumed       = false,
+    .hold_threshold = BUTTON_CHORD_DEFAULT_HOLD_TICKS,
+};
+
+void ButtonChord_Reset(void)
+{
+    if (Mutex_Take(kMutexKey_Buttons) == kMutexResult_Ok)
+    {
+        _Chord.current    = kChordTracked_None;
+        _Chord.hold_count = 0u;
+        _Chord.consumed   = false;
+        (void) Mutex_Give(kMutexKey_Buttons);
+    }
+}
+
+void ButtonChord_SetHoldThreshold(uint16_t ticks)
+{
+    if (ticks == 0u) ticks = 1u;
+    if (Mutex_Take(kMutexKey_Buttons) == kMutexResult_Ok)
+    {
+        _Chord.hold_threshold = ticks;
+        (void) Mutex_Give(kMutexKey_Buttons);
+    }
+}
+
+static ChordTracked_t ChordFromInput(uint16_t buttons)
+{
+    /*
+     * Use the physical BTN_MENU bit only.  In the FPGA payload:
+     *   bit 8 / MenuEnAlt = ~BTN_MENU
+     *   bit 9 / MenuEn    = menuDisabled state
+     */
+    const bool menu_held = (buttons & kButtonBits_MenuEnAlt) != 0u;
+    if (!menu_held) return kChordTracked_None;
+
+    /*
+     * Reject if both Up AND Down are held simultaneously (impossible on
+     * real hardware, indicates a stuck-button state).
+     */
+    const bool down_held = (buttons & kButtonBits_Down) != 0u;
+    const bool up_held   = (buttons & kButtonBits_Up)   != 0u;
+    if (down_held && up_held) return kChordTracked_None;
+    if (down_held) return kChordTracked_Save;
+    if (up_held)   return kChordTracked_Load;
+    return kChordTracked_None;
+}
+
+ButtonChordEvent_t ButtonChord_UpdateWithTick(uint16_t NewButtons,
+                                              uint16_t tick_increment)
+{
+    ButtonChordEvent_t fired = kButtonChord_None;
+
+    if (Mutex_Take(kMutexKey_Buttons) != kMutexResult_Ok) {
+        return kButtonChord_None;
+    }
+
+    const ChordTracked_t input_chord = ChordFromInput(NewButtons);
+    const bool any_menu = (NewButtons & kButtonBits_MenuEnAlt) != 0u;
+
+    if (_Chord.consumed) {
+        /*
+         * Stay in consumed state until BOTH menu bits are released.
+         * Sub-clears (e.g., user releases Down but keeps Menu held) do
+         * not re-arm.  This matches lock §4.8d's "consume the recognized
+         * chord until all keys are released" requirement.
+         */
+        if (!any_menu) {
+            _Chord.consumed   = false;
+            _Chord.current    = kChordTracked_None;
+            _Chord.hold_count = 0u;
+        }
+    } else if (input_chord == kChordTracked_None) {
+        /* Chord not held this tick. */
+        _Chord.current    = kChordTracked_None;
+        _Chord.hold_count = 0u;
+    } else if (_Chord.current != input_chord) {
+        /* Chord changed (e.g., user transitioned from Down to Up). */
+        _Chord.current    = input_chord;
+        _Chord.hold_count = tick_increment;
+    } else {
+        /* Same chord still held. */
+        const uint32_t next = (uint32_t)_Chord.hold_count + tick_increment;
+        _Chord.hold_count = (next > UINT16_MAX) ? UINT16_MAX : (uint16_t)next;
+
+        if (_Chord.hold_count >= _Chord.hold_threshold) {
+            fired = (input_chord == kChordTracked_Save) ? kButtonChord_SaveRequested
+                                                         : kButtonChord_LoadRequested;
+            _Chord.consumed   = true;
+            _Chord.hold_count = 0u;
+        }
+    }
+
+    (void) Mutex_Give(kMutexKey_Buttons);
+    return fired;
+}
+
+ButtonChordEvent_t ButtonChord_Update(uint16_t NewButtons)
+{
+    return ButtonChord_UpdateWithTick(NewButtons, 1u);
+}

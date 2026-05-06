@@ -54,6 +54,15 @@ typedef enum {
     kFusionOp_ReadStreamBegin  = 0x06u,
     kFusionOp_WriteStreamBegin = 0x07u,
     kFusionOp_WriteCommit      = 0x08u,
+    kFusionOp_ReadStreamContinue = 0x09u,
+    /*
+     * Phase 4.8c v2: mixed paused session.  The bridge keeps
+     * session_pause asserted from BEGIN_TEST_RW until END_SESSION and
+     * accepts both READ_STREAM_* and WRITE_STREAM_* in the same
+     * session.  Used only by the strict bit-exact RAM round-trip smoke
+     * harness; OP_BEGIN_SAVE / OP_BEGIN_LOAD semantics are unchanged.
+     */
+    kFusionOp_BeginTestRW      = 0x0Au,
     /* FPGA -> MCU */
     kFusionOp_AckAccepted      = 0x10u,
     kFusionOp_Busy             = 0x11u,
@@ -79,7 +88,11 @@ typedef enum {
     kFusionErr_LocalAbort       = 0x0Du, /* MCU-local: aborted from this side */
 } FusionErrorCode_t;
 
-/* Region IDs (architecture doc Phase 4 plan — names, not adapter availability). */
+/* Region IDs (architecture doc Phase 4 plan — names, not adapter availability).
+ *
+ * Region 0xFE is path-e specific (Gate 1 contract for 4.8d).  Lock should be
+ * amended with §6.4.8d path-e amendment text from the Gate 1 contract.
+ */
 typedef enum {
     kFusionRegion_Header     = 0x00u,
     kFusionRegion_CoreScalar = 0x01u,
@@ -97,7 +110,47 @@ typedef enum {
     kFusionRegion_RomHeader  = 0x0Du,
     kFusionRegion_CartShadow = 0x0Eu,
     kFusionRegion_CartRam    = 0x0Fu,
+
+    /*
+     * Path-e load mode region (4.8d).  16 bytes:
+     *   idx 0:    load_mode_active (data[0])
+     *   idx 1-8:  scratch[0-7] = saved_F, saved_A, saved_C, saved_B,
+     *                            saved_E, saved_D, saved_L, saved_H
+     *   idx 9-10: saved_SP lo / hi
+     *   idx 11:   iff_byte (FB if saved_IFF=1, else 00)
+     *   idx 12:   saved_a (cart-override re-restore after FF50 clobber)
+     *   idx 13-14: saved_PC lo / hi
+     *   idx 15:   gbreset_request (data[0]=1 hold reset, =0 release)
+     *
+     * Read at the same indices (FPGA generates pathe_byte combinationally).
+     */
+    kFusionRegion_PathELoad  = 0xFEu,
 } FusionRegion_t;
+
+/* Path-e region 0xFE byte indices — path-e load state layout. */
+typedef enum {
+    kPathE_LoadModeActive = 0u,
+    kPathE_ScratchF       = 1u,
+    kPathE_ScratchA       = 2u,
+    kPathE_ScratchC       = 3u,
+    kPathE_ScratchB       = 4u,
+    kPathE_ScratchE       = 5u,
+    kPathE_ScratchD       = 6u,
+    kPathE_ScratchL       = 7u,
+    kPathE_ScratchH       = 8u,
+    kPathE_SavedSpLo      = 9u,
+    kPathE_SavedSpHi      = 10u,
+    kPathE_IffByte        = 11u,
+    kPathE_SavedA         = 12u,
+    kPathE_SavedPcLo      = 13u,
+    kPathE_SavedPcHi      = 14u,
+    kPathE_GbresetRequest = 15u,
+    kPathE_RegionLength   = 16u,
+} FusionPathERegionIdx_t;
+
+/* Path-e cart override IFF byte values. */
+#define FUSION_PATHE_IFF_BYTE_EI    0xFBu  /* EI opcode if saved_IFF=1 */
+#define FUSION_PATHE_IFF_BYTE_NOP   0x00u  /* NOP opcode if saved_IFF=0 */
 
 /* Slot commit-state byte values (atomic single-byte transition). */
 typedef enum {
@@ -124,6 +177,8 @@ typedef struct __attribute__((packed)) {
     char     mcu_version[FUSION_VERSION_FIELD_LEN];  /* git short hash, NUL-padded */
     uint32_t region_table_offset;    /* relative to start of slot */
     uint32_t region_count;
+    uint32_t region_bitmap;          /* capability bitmap captured from region 0 header */
+    char     savestate_tag[4];       /* capability tag captured from region 0 header */
     uint32_t payload_crc32;          /* CRC32 over payload + region table */
     uint32_t commit_generation;      /* monotonic per write */
     uint8_t  commit_state;           /* FusionCommitState_t */
@@ -176,6 +231,7 @@ bool FusionSavestate_DecodeV2Frame(const uint8_t *frame,
 
 bool FusionSavestate_BuildBeginSave(uint8_t flags, FusionV2Frame_t *out);
 bool FusionSavestate_BuildBeginLoad(uint8_t flags, FusionV2Frame_t *out);
+bool FusionSavestate_BuildBeginTestRW(uint8_t flags, FusionV2Frame_t *out);
 bool FusionSavestate_BuildEndSession(FusionV2Frame_t *out);
 bool FusionSavestate_BuildSeek(uint8_t region, uint16_t offset, FusionV2Frame_t *out);
 bool FusionSavestate_BuildReadNext(uint8_t count, FusionV2Frame_t *out);
@@ -183,6 +239,8 @@ bool FusionSavestate_BuildReadStreamBegin(uint8_t region,
                                           uint16_t offset,
                                           uint16_t length,
                                           FusionV2Frame_t *out);
+bool FusionSavestate_BuildReadStreamContinue(uint16_t next_seq,
+                                             FusionV2Frame_t *out);
 bool FusionSavestate_BuildWriteStreamBegin(uint8_t region,
                                            uint16_t offset,
                                            uint16_t length,
@@ -202,6 +260,79 @@ bool FusionSavestate_BuildAckAccepted(uint8_t for_opcode, FusionV2Frame_t *out);
 bool FusionSavestate_BuildBusy(uint8_t for_opcode, FusionV2Frame_t *out);
 bool FusionSavestate_BuildAckDone(uint8_t for_opcode, FusionV2Frame_t *out);
 bool FusionSavestate_BuildError(uint8_t code, uint8_t detail, FusionV2Frame_t *out);
+
+/* ---- Path-e (4.8d) load state assembly. ---- */
+
+/*
+ * Captured CPU/HALT/IFF state at save time.  This is the input to the
+ * path-e load payload builder.  saved_PC must be the captured CPU PC
+ * BEFORE any HALT-bug adjustment; the builder applies PC-1 if halted_at_save.
+ *
+ * Capture sources (Gate 1 contract §4):
+ *   saved_A/F/B/C/D/E/H/L/SP/PC : T80 register file via state-port region 0x02
+ *   halted_at_save              : T80 SS_3_BACK[48] = Halt_FF, exposed in
+ *                                 region 0x02 idx 31 byte LSB
+ *   saved_IFF                   : T80 SS_3_BACK[52] = IntE_FF1, exposed in
+ *                                 region 0x02 idx 31 byte bit 4
+ */
+typedef struct {
+    uint8_t  saved_F;
+    uint8_t  saved_A;
+    uint8_t  saved_C;
+    uint8_t  saved_B;
+    uint8_t  saved_E;
+    uint8_t  saved_D;
+    uint8_t  saved_L;
+    uint8_t  saved_H;
+    uint16_t saved_SP;
+    uint16_t saved_PC;        /* unadjusted; builder applies PC-1 if halted */
+    bool     saved_IFF;       /* IME state at save */
+    bool     halted_at_save;  /* Halt_FF=1 at save */
+} FusionPathELoadInput_t;
+
+/*
+ * Build the 16-byte path-e region 0xFE payload from captured save state.
+ * out[0..14] are written to FPGA before gbreset is toggled (load_mode_active
+ * is byte 0; setting it before gbreset arms the load mode).
+ * out[15] is set to 0 by this builder (caller toggles gbreset separately
+ * via two single-byte writes to offset 15).
+ *
+ * Return false on null input or if both halted_at_save=true and saved_PC=0
+ * (PC-1 would underflow into MSB cart-bus space, considered invalid).
+ */
+bool FusionSavestate_BuildPathELoadPayload(const FusionPathELoadInput_t *state,
+                                            uint8_t out[kPathE_RegionLength]);
+
+/*
+ * Extract path-e load input from saved CPU region (region 0x02) bytes.
+ *
+ * Layout per smoke48a convention (verified with FPGA's GBse.vhd / T80.vhd
+ * mappings):
+ *   region 0x02 byte 10..17 = T80 SS_1[0..63] (PC/A/TmpAddr/IR/...)
+ *     - bytes 10-11: PC[7:0], PC[15:8]
+ *     - bytes 12: A (visible ACC value matches SS_2[15:8] but SS_1 PC drives stub)
+ *   region 0x02 byte 18..24 = T80 SS_2[0..55] (DO/ACC/Ap/Fp/I/R/MCycles)
+ *     - byte 19: ACC (= visible A)
+ *   region 0x02 byte 25..32 = T80 SS_3[0..63] (SP/F/IFF/MCycle/TState/Halt_FF/...)
+ *     - bytes 25-26: SP[7:0], SP[15:8]
+ *     - byte 27: SS_3[28:21] = F register
+ *     - byte 31 (= "10101" = SS_3[55:48]): bit 0 = Halt_FF (SS_3[48]),
+ *                                          bit 4 = IntE_FF1 = saved_IFF (SS_3[52])
+ *
+ * For BC/DE/HL: the T80_Reg register file maps to region 0x02 bytes 2-9.
+ *   bytes 2-3: B,C (or C,B?) — exact bit mapping per T80_Reg ext_cpuregs port
+ *
+ * NOTE on byte 19 vs byte 12: SS_1 byte 12 is "A" but in T80.vhd that's
+ * the 16-bit address bus (A[7:0]) — NOT the visible accumulator.  The
+ * visible accumulator is ACC at SS_2[15:8] = byte 19.
+ *
+ * cpu_region_bytes must point to at least 40 bytes of saved CPU region.
+ * Returns false on null inputs or if length < required offset.
+ */
+bool FusionSavestate_ExtractPathELoadInputFromCpuRegion(
+    const uint8_t *cpu_region_bytes,
+    size_t cpu_region_len,
+    FusionPathELoadInput_t *out);
 
 /* ---- CRC-32/ISO-HDLC (zlib/PNG) helpers and game ID v1. ---- */
 

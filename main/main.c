@@ -22,6 +22,9 @@
 #include "fpga_rx.h"
 #include "fpga_tx.h"
 #include "frameblend.h"
+#include "fusion_savestate_smoke48a.h"
+#include "fusion_savestate_smoke48c.h"
+#include "fusion_savestate_transport_probe.h"
 #include "fw.h"
 #include "osd.h"
 #include "osd_default.h"
@@ -64,6 +67,12 @@ static spi_device_handle_t spi;
 static lv_disp_draw_buf_t disp_buf; // contains internal graphic buffer(s) called draw buffer(s)
 static lv_disp_drv_t disp_drv;      // contains callback functions
 static lv_disp_t *disp;
+static TaskHandle_t lvglTimerTaskHandle = NULL;
+
+TaskHandle_t FusionApp_GetLvglTimerTaskHandle(void)
+{
+    return lvglTimerTaskHandle;
+}
 
 // Having some issue with floating point here so scale 9.6 10x
 #define ROWS_PER_XFER_X10 32
@@ -228,6 +237,7 @@ void app_main(void)
 {
     persist_storage_init();
     Mutex_Init();
+    FPGA_UartOwnerInit();
 
     // Set up the system management UART to/from the FPGA
     ESP_LOGI(TAG, "Initialize FPGA UART");
@@ -246,6 +256,13 @@ void app_main(void)
 
     gpio_sleep_set_direction(PIN_NUM_UART_FROM_FPGA, GPIO_MODE_INPUT);
     gpio_sleep_set_pull_mode(PIN_NUM_UART_FROM_FPGA, GPIO_PULLUP_ONLY);
+
+#if defined(FUSION_TRANSPORT_PROBE_BOOT_AUTO)
+    FusionSavestateTransportProbe_RunBootProbeOnce();
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
 
     // Task is created earlier than the others to apply the settings ASAP
     xTaskCreate(FPGA_TxTask, "fpga_tx_task", kFPGATxTask_StackDepth, NULL, kFPGATxTask_Priority, FPGA_GetTxTaskHandle());
@@ -333,7 +350,7 @@ void app_main(void)
 
     Gfx_Start(scr);
 
-    xTaskCreatePinnedToCore(lvglTimerTask, "lvgl Timer", kTimerTask_StackDepth, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(lvglTimerTask, "lvgl Timer", kTimerTask_StackDepth, NULL, 4, &lvglTimerTaskHandle, 1);
 
     // Prompt to be printed before each line.
     ReplConfig.prompt = "mcu> ";
@@ -344,8 +361,18 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&ReplHWConfig, &ReplConfig, &pRepl));
     esp_console_register_help_command();
+    FusionSavestateSmoke48a_RegisterCommands();
+    FusionSavestateSmoke48c_RegisterCommands();
+    FusionSavestateTransportProbe_RegisterCommands();
     // All commands must be registered prior to starting the REPL
     ESP_ERROR_CHECK(esp_console_start_repl(pRepl));
+
+    /*
+     * Path-e (4.8d) chord-triggered save/load dispatcher.  Listens for
+     * MENU+DOWN/UP chord events from the button RX path and dispatches
+     * the corresponding QuickSave / QuickLoad on its own task.
+     */
+    FusionSavestate_StartChordDispatcher();
 
     vTaskDelay( pdMS_TO_TICKS(2000) );
     xTaskCreate(PwrMgr_Task, "pwr_mgr_task", kSleepTask_StackDepth, NULL, kSleepTask_Priority, NULL);

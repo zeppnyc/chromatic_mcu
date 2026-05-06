@@ -144,6 +144,12 @@ bool FusionSavestate_BuildBeginLoad(uint8_t flags, FusionV2Frame_t *out)
     return BuildCtl(p, sizeof(p), out);
 }
 
+bool FusionSavestate_BuildBeginTestRW(uint8_t flags, FusionV2Frame_t *out)
+{
+    const uint8_t p[2] = { (uint8_t)kFusionOp_BeginTestRW, flags };
+    return BuildCtl(p, sizeof(p), out);
+}
+
 bool FusionSavestate_BuildEndSession(FusionV2Frame_t *out)
 {
     const uint8_t p[1] = { (uint8_t)kFusionOp_EndSession };
@@ -194,6 +200,17 @@ bool FusionSavestate_BuildReadStreamBegin(uint8_t region,
 {
     return BuildStreamBegin((uint8_t)kFusionOp_ReadStreamBegin,
                             region, offset, length, out);
+}
+
+bool FusionSavestate_BuildReadStreamContinue(uint16_t next_seq,
+                                             FusionV2Frame_t *out)
+{
+    const uint8_t p[3] = {
+        (uint8_t)kFusionOp_ReadStreamContinue,
+        (uint8_t)(next_seq & 0xFFu),
+        (uint8_t)((next_seq >> 8) & 0xFFu),
+    };
+    return BuildCtl(p, sizeof(p), out);
 }
 
 bool FusionSavestate_BuildWriteStreamBegin(uint8_t region,
@@ -284,4 +301,140 @@ uint32_t FusionSavestate_ComputeGameIdV1(const uint8_t rom_header[FUSION_ROM_HEA
         return 0u;
     }
     return FusionSavestate_Crc32(rom_header, FUSION_ROM_HEADER_BYTES);
+}
+
+/*
+ * CPU region (region 0x02) saved-slot byte offsets per FPGA mapping
+ * (verified against T80.vhd, T80_Reg.vhd, GBse.vhd):
+ *
+ *   offset 0-1   GBSE state
+ *   offset 2-9   T80_Reg CPUREGS file (RegsL/H 0-3)
+ *     2: RegsL(0) = C
+ *     3: RegsL(1) = E
+ *     4: RegsL(2) = L
+ *     5: RegsL(3) = unused (GB only uses 0-2 of L bank)
+ *     6: RegsH(0) = B
+ *     7: RegsH(1) = D
+ *     8: RegsH(2) = H
+ *     9: RegsH(3) = unused
+ *   offset 10-17 T80 SS_1
+ *     10-11: PC (lo, hi)
+ *     12-13: address bus latch (NOT visible A)
+ *   offset 18-24 T80 SS_2
+ *     19: SS_2[15:8] = ACC (visible A)
+ *   offset 25-32 T80 SS_3
+ *     25-26: SP (lo, hi)
+ *     27: SS_3[23:16] = Read_To_Reg_r + low F bits (always 0 in GB mode)
+ *     28: SS_3[31:24] - bits 4-1 = F[7:4] = Z/N/H/C; bits 7-5 = Arith16_r etc
+ *     31: SS_3[55:48] - bit 0 = Halt_FF, bit 4 = IntE_FF1 (saved_IFF)
+ *   offset 33-39 T80 SS_4 (RegBus/Bus latches, not used by path-e)
+ *
+ * F register: GB mode T80 hardware-clamps F[3:0]=0 (T80.vhd line 897-899).
+ * Non-byte-aligned extraction:
+ *   F[7] = byte28 bit 4 (Z)
+ *   F[6] = byte28 bit 3 (N)
+ *   F[5] = byte28 bit 2 (H)
+ *   F[4] = byte28 bit 1 (C)
+ *   F[3:0] = 0
+ *   => F = (byte28 << 3) & 0xF0
+ */
+#define PATHE_CPU_REGION_MIN_BYTES  32u
+#define PATHE_CPU_OFF_C             2u
+#define PATHE_CPU_OFF_E             3u
+#define PATHE_CPU_OFF_L             4u
+#define PATHE_CPU_OFF_B             6u
+#define PATHE_CPU_OFF_D             7u
+#define PATHE_CPU_OFF_H             8u
+#define PATHE_CPU_OFF_PC_LO         10u
+#define PATHE_CPU_OFF_PC_HI         11u
+#define PATHE_CPU_OFF_ACC           19u
+#define PATHE_CPU_OFF_SP_LO         25u
+#define PATHE_CPU_OFF_SP_HI         26u
+#define PATHE_CPU_OFF_F_BYTE        28u
+#define PATHE_CPU_OFF_HALT_IFF_BYTE 31u
+#define PATHE_HALT_FF_BIT           0x01u
+#define PATHE_IFF_FF1_BIT           0x10u  /* SS_3[52] = bit 4 of byte 31 */
+
+bool FusionSavestate_ExtractPathELoadInputFromCpuRegion(
+    const uint8_t *cpu_region_bytes,
+    size_t cpu_region_len,
+    FusionPathELoadInput_t *out)
+{
+    if (cpu_region_bytes == NULL || out == NULL) {
+        return false;
+    }
+    if (cpu_region_len < PATHE_CPU_REGION_MIN_BYTES) {
+        return false;
+    }
+
+    out->saved_C = cpu_region_bytes[PATHE_CPU_OFF_C];
+    out->saved_E = cpu_region_bytes[PATHE_CPU_OFF_E];
+    out->saved_L = cpu_region_bytes[PATHE_CPU_OFF_L];
+    out->saved_B = cpu_region_bytes[PATHE_CPU_OFF_B];
+    out->saved_D = cpu_region_bytes[PATHE_CPU_OFF_D];
+    out->saved_H = cpu_region_bytes[PATHE_CPU_OFF_H];
+
+    out->saved_A = cpu_region_bytes[PATHE_CPU_OFF_ACC];
+
+    /* F: extract bits Z/N/H/C from byte28 bits 4-1, F[3:0]=0 */
+    const uint8_t byte28 = cpu_region_bytes[PATHE_CPU_OFF_F_BYTE];
+    out->saved_F = (uint8_t)((byte28 << 3) & 0xF0u);
+
+    out->saved_PC = (uint16_t)(cpu_region_bytes[PATHE_CPU_OFF_PC_LO] |
+                               ((uint16_t)cpu_region_bytes[PATHE_CPU_OFF_PC_HI] << 8));
+    out->saved_SP = (uint16_t)(cpu_region_bytes[PATHE_CPU_OFF_SP_LO] |
+                               ((uint16_t)cpu_region_bytes[PATHE_CPU_OFF_SP_HI] << 8));
+
+    const uint8_t halt_iff_byte = cpu_region_bytes[PATHE_CPU_OFF_HALT_IFF_BYTE];
+    out->halted_at_save = (halt_iff_byte & PATHE_HALT_FF_BIT) != 0u;
+    out->saved_IFF      = (halt_iff_byte & PATHE_IFF_FF1_BIT) != 0u;
+
+    return true;
+}
+
+bool FusionSavestate_BuildPathELoadPayload(const FusionPathELoadInput_t *state,
+                                            uint8_t out[kPathE_RegionLength])
+{
+    if (state == NULL || out == NULL) {
+        return false;
+    }
+
+    /*
+     * HALT-during-save adjustment per Gate 1 contract §4:
+     *   if Halt_FF=1 at save time, saved_PC := captured_PC - 1
+     * so the CPU re-executes the HALT opcode and naturally re-enters
+     * HALT mode on load.
+     *
+     * Reject the (rare) case where halted_at_save=true and saved_PC=0
+     * since PC-1 would underflow.  A real GB cannot be in HALT at
+     * PC=$0000 in practice, but explicit rejection is safer than
+     * letting the load proceed with PC=$FFFF (cart bus high region).
+     */
+    uint16_t adjusted_pc = state->saved_PC;
+    if (state->halted_at_save) {
+        if (state->saved_PC == 0u) {
+            return false;
+        }
+        adjusted_pc = (uint16_t)(state->saved_PC - 1u);
+    }
+
+    out[kPathE_LoadModeActive] = 1u;       /* arm load mode */
+    out[kPathE_ScratchF]       = state->saved_F;
+    out[kPathE_ScratchA]       = state->saved_A;
+    out[kPathE_ScratchC]       = state->saved_C;
+    out[kPathE_ScratchB]       = state->saved_B;
+    out[kPathE_ScratchE]       = state->saved_E;
+    out[kPathE_ScratchD]       = state->saved_D;
+    out[kPathE_ScratchL]       = state->saved_L;
+    out[kPathE_ScratchH]       = state->saved_H;
+    out[kPathE_SavedSpLo]      = (uint8_t)(state->saved_SP & 0xFFu);
+    out[kPathE_SavedSpHi]      = (uint8_t)((state->saved_SP >> 8) & 0xFFu);
+    out[kPathE_IffByte]        = state->saved_IFF ? FUSION_PATHE_IFF_BYTE_EI
+                                                  : FUSION_PATHE_IFF_BYTE_NOP;
+    out[kPathE_SavedA]         = state->saved_A;  /* re-restore A after FF50 */
+    out[kPathE_SavedPcLo]      = (uint8_t)(adjusted_pc & 0xFFu);
+    out[kPathE_SavedPcHi]      = (uint8_t)((adjusted_pc >> 8) & 0xFFu);
+    out[kPathE_GbresetRequest] = 0u;       /* caller toggles via separate writes */
+
+    return true;
 }

@@ -15,6 +15,7 @@
 #include "osd.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 enum {
     kIdleTime_ms = 100,
@@ -29,6 +30,9 @@ static const char *TAG = "PwrMgr";
 static TaskHandle_t PwrMgrTaskHandle = NULL;
 static TimerHandle_t IdleSystemTimer = NULL;
 static StaticTimer_t IdleTimerBuffer;
+static volatile bool IdleTimerSuspended = false;
+static volatile uint32_t IdleActivityGeneration = 0;
+static volatile uint32_t IdleSleepRequestGeneration = 0;
 static LowPowerMode_t LPM_Status;
 static SemaphoreHandle_t xSemaphore;
 static StaticSemaphore_t xMutexBuffer;
@@ -43,6 +47,22 @@ static const gpio_config_t WakeUpPin = {
 };
 
 static void IdleTimerCB( TimerHandle_t xTimer );
+
+static bool ShouldAbortSleep(uint32_t sleep_request_generation)
+{
+    return IdleTimerSuspended || IdleActivityGeneration != sleep_request_generation;
+}
+
+static bool AbortSleepIfCanceled(uint32_t sleep_request_generation)
+{
+    if (!ShouldAbortSleep(sleep_request_generation))
+    {
+        return false;
+    }
+    FPGA_Rx_Resume();
+    FPGA_Tx_Resume();
+    return true;
+}
 
 void PwrMgr_Task(void *arg)
 {
@@ -66,10 +86,20 @@ void PwrMgr_Task(void *arg)
     {
         if (ulTaskNotifyTake(pdTRUE, portMAX_DELAY))
         {
+            const uint32_t sleep_request_generation = IdleSleepRequestGeneration;
+            if (ShouldAbortSleep(sleep_request_generation))
+            {
+                continue;
+            }
+
             // Pause both tasks to ensure that they finish up any work in progress. Since the Sleep task is of higher priority,
             // the delays below are taken advantage of to permit a context switch.
             FPGA_Tx_Pause();
             FPGA_Rx_Pause();
+            if (AbortSleepIfCanceled(sleep_request_generation))
+            {
+                continue;
+            }
 
             // Clear out any pending data that the FPGA may have sent
             uart_flush(UART_NUM_1);
@@ -80,8 +110,17 @@ void PwrMgr_Task(void *arg)
             gpio_config(&WakeUpPin);
             gpio_wakeup_enable(PIN_NUM_UART_FROM_FPGA, GPIO_INTR_LOW_LEVEL);
             vTaskDelay(pdMS_TO_TICKS(10));
+            if (AbortSleepIfCanceled(sleep_request_generation))
+            {
+                continue;
+            }
+
             esp_sleep_enable_gpio_wakeup();
             vTaskDelay(pdMS_TO_TICKS(10));
+            if (AbortSleepIfCanceled(sleep_request_generation))
+            {
+                continue;
+            }
 
             // Tell the world we are sleeping and wait for the message to go out...
             ESP_LOGD(TAG, "Sleeping");
@@ -104,17 +143,25 @@ void PwrMgr_Task(void *arg)
 
 void PwrMgr_TriggerLightSleep(void)
 {
+    if (IdleTimerSuspended)
+    {
+        return;
+    }
+
     // Wait for the sleep task to start
     while(PwrMgrTaskHandle == NULL)
     {
         vTaskDelay(1);
     }
 
+    IdleSleepRequestGeneration = IdleActivityGeneration;
     (void) xTaskNotifyGive(PwrMgrTaskHandle);
 }
 
 void PwrMgr_IdleTimerPet(void)
 {
+    IdleActivityGeneration++;
+
     // Wait for the task to start
     if (IdleSystemTimer == NULL)
     {
@@ -122,6 +169,25 @@ void PwrMgr_IdleTimerPet(void)
     }
 
     (void) xTimerReset(IdleSystemTimer, portMAX_DELAY);
+}
+
+void PwrMgr_IdleTimerSuspend(void)
+{
+    IdleTimerSuspended = true;
+    if (IdleSystemTimer != NULL)
+    {
+        (void) xTimerStop(IdleSystemTimer, portMAX_DELAY);
+    }
+    if (PwrMgrTaskHandle != NULL)
+    {
+        (void) xTaskNotifyGive(PwrMgrTaskHandle);
+    }
+}
+
+void PwrMgr_IdleTimerResume(void)
+{
+    IdleTimerSuspended = false;
+    PwrMgr_IdleTimerPet();
 }
 
 static void IdleTimerCB( TimerHandle_t xTimer )

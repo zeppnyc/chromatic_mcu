@@ -71,6 +71,7 @@ static StaticEventGroup_t xCreatedEventGroup;
 static const char* TAG = "FpgaTx";
 
 static size_t SetupTxBuffer(uint8_t *const pBuffer, TxIDs_t eID, uint8_t Len, void* pData);
+static void WriteUartOwned(const uint8_t *pBuffer, size_t Size);
 
 void FPGA_TxTask(void *arg)
 {
@@ -109,7 +110,7 @@ void FPGA_TxTask(void *arg)
             if (Backlight < MaxDisplayBrightness)
             {
                 const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_BacklightCtl, sizeof(Backlight), (void*)&Backlight);
-                (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
+                WriteUartOwned(TxBuffer, Size);
             }
         }
 
@@ -128,28 +129,28 @@ void FPGA_TxTask(void *arg)
 
             const uint16_t Payload = ( (frame_blending << 1) | (color_correct << 2) | ismuted | (playernum << 4) | (EnableScreenTransitionFix << 12) | (IgnoreDiagonalInputs << 11) | (LowBattIconControl << 13));
             const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_SysCtrl, sizeof(Payload), (void*)&Payload);
-            (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
+            WriteUartOwned(TxBuffer, Size);
         }
 
         if ((EventBits & kTxFlag_RequestFWVer) == kTxFlag_RequestFWVer)
         {
             uint16_t dummy = 0;
             const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_ReqFWVer, sizeof(dummy), &dummy);
-            (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
+            WriteUartOwned(TxBuffer, Size);
         }
 
         if ((EventBits & kTxFlag_PokeButton) == kTxFlag_PokeButton)
         {
             const uint16_t PokedButtons = Button_GetPokedInputs();
             const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_PokeButton, sizeof(PokedButtons), (void*)&PokedButtons);
-            (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
+            WriteUartOwned(TxBuffer, Size);
         }
 
         if ((EventBits & kTxFlag_RequestBGPD) == kTxFlag_RequestBGPD)
         {
             uint16_t dummy = 0;
             const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_ReqBGPD, sizeof(dummy), &dummy);
-            (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
+            WriteUartOwned(TxBuffer, Size);
         }
 
         if ((EventBits & kTxFlag_SetPaletteStyle) == kTxFlag_SetPaletteStyle)
@@ -168,19 +169,19 @@ void FPGA_TxTask(void *arg)
 
             // BG
             const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_BGPaletteCtl, sizeof(PayloadBG), (void*)&PayloadBG);
-            (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
+            WriteUartOwned(TxBuffer, Size);
 
             // Sprite - Obj0
             const uint64_t ColorObj0 = Pal_GetColor(ID, kPalette_Obj0);
             const uint64_t PayloadObj0 = __builtin_bswap64(ColorObj0);
             const size_t Size2 = SetupTxBuffer(TxBuffer, kTxCmd_SpritePaletteCtl, sizeof(PayloadObj0), (void*)&PayloadObj0);
-            (void)uart_write_bytes(UART_NUM_1, TxBuffer, Size2);
+            WriteUartOwned(TxBuffer, Size2);
 
             // Sprite - Obj1
             const uint64_t ColorObj1 = Pal_GetColor(ID, kPalette_Obj1);
             const uint64_t PayloadObj1 = __builtin_bswap64(ColorObj1 | ((uint64_t)1 << kCustomPaletteObjSel));
             const size_t Size3 = SetupTxBuffer(TxBuffer, kTxCmd_SpritePaletteCtl, sizeof(PayloadObj1), (void*)&PayloadObj1);
-            (void)uart_write_bytes(UART_NUM_1, TxBuffer, Size3);
+            WriteUartOwned(TxBuffer, Size3);
         }
 
         memset(TxBuffer, 0x0, sizeof(TxBuffer));
@@ -260,4 +261,15 @@ static size_t SetupTxBuffer(uint8_t *const pBuffer, TxIDs_t eID, uint8_t Len, vo
     }
 
     return MsgSize;
+}
+
+static void WriteUartOwned(const uint8_t *pBuffer, size_t Size)
+{
+    if (pBuffer == NULL || Size == 0u) {
+        return;
+    }
+    if (FPGA_UartOwnerAcquire(pdMS_TO_TICKS(100))) {
+        (void)uart_write_bytes(UART_NUM_1, pBuffer, Size);
+        FPGA_UartOwnerRelease();
+    }
 }

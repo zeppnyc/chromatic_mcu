@@ -184,6 +184,12 @@ static void test_ctl_builders(void)
     EXPECT_EQ_U(d.payload[4], 0x7Fu);
     EXPECT_EQ_U(d.payload[5], 0x00u);
 
+    EXPECT(FusionSavestate_BuildReadStreamContinue(0x1234u, &frame));
+    EXPECT(FusionSavestate_DecodeV2Frame(frame.bytes, frame.length, &d));
+    EXPECT_EQ_U(d.ctl_opcode, (uint8_t)kFusionOp_ReadStreamContinue);
+    EXPECT_EQ_U(d.payload[1], 0x34u);
+    EXPECT_EQ_U(d.payload[2], 0x12u);
+
     EXPECT(FusionSavestate_BuildAckAccepted(kFusionOp_BeginLoad, &frame));
     EXPECT(FusionSavestate_DecodeV2Frame(frame.bytes, frame.length, &d));
     EXPECT_EQ_U(d.ctl_opcode, (uint8_t)kFusionOp_AckAccepted);
@@ -399,7 +405,7 @@ static void test_game_id_v1_deterministic(void)
 static void test_storage_header_layout(void)
 {
     fprintf(stderr, "[test] FusionStateHeader / RegionDirectory size and field sanity\n");
-    EXPECT_EQ_U(sizeof(FusionStateHeader_t), 56u);
+    EXPECT_EQ_U(sizeof(FusionStateHeader_t), 64u);
     EXPECT_EQ_U(sizeof(FusionRegionDirectory_t), 16u);
     /* Magic must round-trip as 'F','U','S','S' little-endian. */
     EXPECT_EQ_U(FUSION_SAVESTATE_MAGIC, 0x53535546u);
@@ -439,6 +445,8 @@ static void test_storage_two_phase_commit(void)
     memcpy(hdr.fpga_version, "abcdef12", 8);
     memcpy(hdr.mcu_version,  "12345678", 8);
     hdr.commit_generation = 42u;
+    hdr.region_bitmap = 0x00000200u;
+    memcpy(hdr.savestate_tag, "P470", 4);
     EXPECT_EQ_U(FusionStorage_StageHeader(&s, &hdr, &dir, 1u), kFusionStorage_Ok);
 
     /* Before commit, no slot is "newest valid". */
@@ -475,6 +483,14 @@ static void test_storage_two_phase_commit(void)
     EXPECT_EQ_U(FusionStorage_FindNewestValidSlot(&s, &newest, &newest_gen),
                 kFusionStorage_Ok);
     EXPECT_EQ_U(newest_gen, 100u);
+
+    EXPECT_EQ_U(FusionStorage_InvalidateSlot(&s, newest), kFusionStorage_Ok);
+    EXPECT_EQ_U(FusionStorage_FindNewestValidSlot(&s, &newest, &newest_gen),
+                kFusionStorage_Ok);
+    EXPECT_EQ_U(newest_gen, 42u);
+    EXPECT_EQ_U(FusionStorage_InvalidateSlot(&s, newest), kFusionStorage_Ok);
+    EXPECT_EQ_U(FusionStorage_FindNewestValidSlot(&s, &newest, &newest_gen),
+                kFusionStorage_NoValidSlot);
 }
 
 static void test_storage_partition_init_deferred(void)
@@ -483,6 +499,145 @@ static void test_storage_partition_init_deferred(void)
     FusionStorage_t s;
     EXPECT_EQ_U(FusionStorage_InitFromPartition(&s, "savestate"),
                 kFusionStorage_NotImplemented);
+}
+
+static void test_pathe_load_payload_basic(void)
+{
+    fprintf(stderr, "[test] path-e load payload basic IME=1\n");
+    FusionPathELoadInput_t s = {
+        .saved_F = 0xA0u, .saved_A = 0x7Fu,
+        .saved_C = 0x34u, .saved_B = 0x12u,
+        .saved_E = 0x78u, .saved_D = 0x56u,
+        .saved_L = 0xBCu, .saved_H = 0x9Au,
+        .saved_SP = 0xDEADu,
+        .saved_PC = 0x0150u,
+        .saved_IFF = true,
+        .halted_at_save = false,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(FusionSavestate_BuildPathELoadPayload(&s, out));
+    EXPECT_EQ_U(out[kPathE_LoadModeActive], 1u);
+    EXPECT_EQ_U(out[kPathE_ScratchF], 0xA0u);
+    EXPECT_EQ_U(out[kPathE_ScratchA], 0x7Fu);
+    EXPECT_EQ_U(out[kPathE_ScratchC], 0x34u);
+    EXPECT_EQ_U(out[kPathE_ScratchB], 0x12u);
+    EXPECT_EQ_U(out[kPathE_ScratchE], 0x78u);
+    EXPECT_EQ_U(out[kPathE_ScratchD], 0x56u);
+    EXPECT_EQ_U(out[kPathE_ScratchL], 0xBCu);
+    EXPECT_EQ_U(out[kPathE_ScratchH], 0x9Au);
+    EXPECT_EQ_U(out[kPathE_SavedSpLo], 0xADu);
+    EXPECT_EQ_U(out[kPathE_SavedSpHi], 0xDEu);
+    EXPECT_EQ_U(out[kPathE_IffByte], FUSION_PATHE_IFF_BYTE_EI);  /* 0xFB EI */
+    EXPECT_EQ_U(out[kPathE_SavedA], 0x7Fu);
+    EXPECT_EQ_U(out[kPathE_SavedPcLo], 0x50u);
+    EXPECT_EQ_U(out[kPathE_SavedPcHi], 0x01u);
+    EXPECT_EQ_U(out[kPathE_GbresetRequest], 0u);
+}
+
+static void test_pathe_load_payload_ime0(void)
+{
+    fprintf(stderr, "[test] path-e load payload IME=0 selects NOP\n");
+    FusionPathELoadInput_t s = {
+        .saved_F = 0x00u, .saved_A = 0x00u,
+        .saved_SP = 0xFFFEu, .saved_PC = 0x0150u,
+        .saved_IFF = false, .halted_at_save = false,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(FusionSavestate_BuildPathELoadPayload(&s, out));
+    EXPECT_EQ_U(out[kPathE_IffByte], FUSION_PATHE_IFF_BYTE_NOP);  /* 0x00 NOP */
+}
+
+static void test_pathe_load_payload_halt_pc_minus1(void)
+{
+    fprintf(stderr, "[test] path-e load payload HALT applies PC-1\n");
+    FusionPathELoadInput_t s = {
+        .saved_PC = 0x0234u,         /* CPU was at instruction after HALT */
+        .saved_IFF = true, .halted_at_save = true,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(FusionSavestate_BuildPathELoadPayload(&s, out));
+    /* Adjusted to 0x0233 = HALT opcode address. */
+    EXPECT_EQ_U(out[kPathE_SavedPcLo], 0x33u);
+    EXPECT_EQ_U(out[kPathE_SavedPcHi], 0x02u);
+}
+
+static void test_pathe_load_payload_rejects_pc0_halt(void)
+{
+    fprintf(stderr, "[test] path-e load payload rejects HALT at PC=0\n");
+    FusionPathELoadInput_t s = {
+        .saved_PC = 0x0000u,
+        .halted_at_save = true,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(!FusionSavestate_BuildPathELoadPayload(&s, out));
+}
+
+static void test_pathe_load_payload_null_inputs(void)
+{
+    fprintf(stderr, "[test] path-e load payload rejects null inputs\n");
+    FusionPathELoadInput_t s = {0};
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(!FusionSavestate_BuildPathELoadPayload(NULL, out));
+    EXPECT(!FusionSavestate_BuildPathELoadPayload(&s, NULL));
+}
+
+static void test_pathe_extract_from_cpu_region(void)
+{
+    fprintf(stderr, "[test] path-e extract input from saved CPU region bytes\n");
+    /* Construct a synthetic 40-byte CPU region with known field values. */
+    uint8_t cpu[40] = {0};
+    /* GBSE bytes 0-1 (don't care for this test) */
+    cpu[2] = 0x34u;  /* C */
+    cpu[3] = 0x78u;  /* E */
+    cpu[4] = 0xBCu;  /* L */
+    cpu[6] = 0x12u;  /* B */
+    cpu[7] = 0x56u;  /* D */
+    cpu[8] = 0x9Au;  /* H */
+    cpu[10] = 0x50u; /* PC lo */
+    cpu[11] = 0x01u; /* PC hi */
+    cpu[19] = 0x7Fu; /* ACC = visible A */
+    cpu[25] = 0xADu; /* SP lo */
+    cpu[26] = 0xDEu; /* SP hi */
+    /*
+     * F = 0xA0 means Z=1, N=0, H=1, C=0; encoded in byte 28:
+     *   F[7]=Z=1 -> bit 4 of byte28 = 1
+     *   F[6]=N=0 -> bit 3 of byte28 = 0
+     *   F[5]=H=1 -> bit 2 of byte28 = 1
+     *   F[4]=C=0 -> bit 1 of byte28 = 0
+     * byte28 lower 5 bits = 0b10100 = 0x14
+     */
+    cpu[28] = 0x14u;
+    cpu[31] = 0x10u;  /* IFF=1 (bit 4), Halt=0 (bit 0) */
+
+    FusionPathELoadInput_t state = {0};
+    EXPECT(FusionSavestate_ExtractPathELoadInputFromCpuRegion(cpu, sizeof(cpu), &state));
+    EXPECT_EQ_U(state.saved_C, 0x34u);
+    EXPECT_EQ_U(state.saved_E, 0x78u);
+    EXPECT_EQ_U(state.saved_L, 0xBCu);
+    EXPECT_EQ_U(state.saved_B, 0x12u);
+    EXPECT_EQ_U(state.saved_D, 0x56u);
+    EXPECT_EQ_U(state.saved_H, 0x9Au);
+    EXPECT_EQ_U(state.saved_A, 0x7Fu);
+    EXPECT_EQ_U(state.saved_F, 0xA0u);
+    EXPECT_EQ_U(state.saved_PC, 0x0150u);
+    EXPECT_EQ_U(state.saved_SP, 0xDEADu);
+    EXPECT(state.saved_IFF);
+    EXPECT(!state.halted_at_save);
+
+    /* Halt scenario: byte 31 bit 0 = 1, IFF still 1 */
+    cpu[31] = 0x11u;
+    EXPECT(FusionSavestate_ExtractPathELoadInputFromCpuRegion(cpu, sizeof(cpu), &state));
+    EXPECT(state.halted_at_save);
+    EXPECT(state.saved_IFF);
+}
+
+static void test_pathe_extract_rejects_short_input(void)
+{
+    fprintf(stderr, "[test] path-e extract rejects short input\n");
+    uint8_t cpu[16] = {0};
+    FusionPathELoadInput_t state = {0};
+    EXPECT(!FusionSavestate_ExtractPathELoadInputFromCpuRegion(cpu, sizeof(cpu), &state));
+    EXPECT(!FusionSavestate_ExtractPathELoadInputFromCpuRegion(NULL, 40, &state));
 }
 
 int main(void)
@@ -503,6 +658,13 @@ int main(void)
     test_storage_header_layout();
     test_storage_two_phase_commit();
     test_storage_partition_init_deferred();
+    test_pathe_load_payload_basic();
+    test_pathe_load_payload_ime0();
+    test_pathe_load_payload_halt_pc_minus1();
+    test_pathe_load_payload_rejects_pc0_halt();
+    test_pathe_load_payload_null_inputs();
+    test_pathe_extract_from_cpu_region();
+    test_pathe_extract_rejects_short_input();
 
     fprintf(stderr, "\n%d passed, %d failed\n", g_pass_count, g_fail_count);
     return g_fail_count == 0 ? 0 : 1;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include <stdint.h>
@@ -22,3 +23,6 @@ TaskHandle_t* FPGA_GetTxTaskHandle(void);
 TaskHandle_t* FPGA_GetRxTaskHandle(void);
 bool FPGA_IsProtoV1(void);
 void FPGA_SetProtoV1(const bool V1);
+void FPGA_UartOwnerInit(void);
+bool FPGA_UartOwnerAcquire(TickType_t wait_ticks);
+void FPGA_UartOwnerRelease(void);
