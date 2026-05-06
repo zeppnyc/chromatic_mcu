@@ -14,9 +14,11 @@ idf_component_register(SRCS
                         "osd_default.c"
                         "status/brightness.c"
                         "status/fw.c"
+                        "status/savestate_toast.c"
                         "system/silent.c"
                         "system/serial_num.c"
                         "system/player_num.c"
+                        "system/save_slot.c"
                     INCLUDE_DIRS
                         "."
                         "controls/"

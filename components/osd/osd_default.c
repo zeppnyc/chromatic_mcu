@@ -8,6 +8,7 @@
 #include "tab_table.h"
 #include "status/fw.h"
 #include "status/brightness.h"
+#include "status/savestate_toast.h"
 #include "controls/dpad_ctl.h"
 #include "controls/hotkeys.h"
 #include "palette/style.h"
@@ -20,6 +21,7 @@
 #include "system/silent.h"
 #include "system/player_num.h"
 #include "system/serial_num.h"
+#include "system/save_slot.h"
 #include "osd.h"
 #include "osd_shared.h"
 #include "esp_log.h"
@@ -62,6 +64,14 @@ void OSD_Default_Init(lv_obj_t *const pScreen)
         return;
     }
 
+    /* Path-e (4.8d) save/load result toast widget. */
+    static OSD_Widget_t SavestateToast;
+    if ((eResult = SavestateToast_Initialize(&SavestateToast)) != kOSD_Result_Ok)
+    {
+        ESP_LOGE(TAG, "Savestate toast widget init failed %d", eResult);
+        /* Non-fatal: keep going with rest of OSD even if toast init failed. */
+    }
+
     CreateMenuStatus(pScreen);
     CreateMenuDisplay(pScreen);
     CreateMenuControls(pScreen);
@@ -70,6 +80,9 @@ void OSD_Default_Init(lv_obj_t *const pScreen)
 
     OSD_AddWidget(&Battery);
     OSD_AddWidget(&MenuMgr);
+    if (eResult == kOSD_Result_Ok) {
+        OSD_AddWidget(&SavestateToast);
+    }
 
     ESP_LOGI(TAG, "Default OSD init OK");
 }
@@ -423,6 +436,23 @@ static void CreateMenuSystem(lv_obj_t *const pScreen)
             ESP_LOGE(TAG, "%s tab item init failed %d", SerialNumber.Widget.Name, eResult);
             return;
         }
+    }
+
+    /*
+     * Path-e (4.8d) Save Slot menu item.  Read-only.  Per lock §4.8d
+     * line 472-474 it appears AFTER Firmware and Player.  Main pushes
+     * slot status text via SaveSlot_SetText after boot/save/load events.
+     */
+    static TabItem_t SaveSlotItem;
+    if ((eResult = SaveSlot_Init(&SaveSlotItem.Widget)) != kOSD_Result_Ok)
+    {
+        ESP_LOGE(TAG, "Save Slot widget init failed %d", eResult);
+        return;
+    }
+    if ((eResult = Tab_AddItem(pList, &SaveSlotItem, pScreen)) != kOSD_Result_Ok)
+    {
+        ESP_LOGE(TAG, "%s tab item init failed %d", SaveSlotItem.Widget.Name, eResult);
+        return;
     }
 
     if ((eResult = MenuMgr_AddTab(kTabID_System, &Tab_System)) != kOSD_Result_Ok)
