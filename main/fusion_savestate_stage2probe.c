@@ -31,6 +31,20 @@ enum {
     kStage2ProgressPackets = 512,
     kStage2BadPayloadDumpBytes = 24,
     kStage2CaptureRestoreMaxDelayS = 600,
+    /* Batch 1: ms to wait after BEGIN_LOAD ACK before issuing the first
+       WRITE_STREAM_BEGIN.  Matches the BEGIN_SAVE 2 ms settle in spirit:
+       gives session_pause time to propagate from gClk to hclk so the
+       loader/WRAM port-A muxes are quiet before host writes start. */
+    kStage2BeginLoadSettleMs = 3,
+    /* Batch 1: abort probe parameters.  abort-read captures N DATA packets
+       then injects END_SESSION instead of READ_STREAM_CONTINUE; abort-load
+       sends N STATE_DATA packets then END_SESSION instead of WRITE_COMMIT.
+       Numbers are deliberately small so the abort happens inside an
+       active stream, not after it has naturally finished. */
+    kStage2AbortReadPackets = 5,
+    kStage2AbortLoadPackets = 2,
+    kStage2AbortLoadProcessMs = 5,
+    kStage2AbortDrainBudgetMs = 800,
 };
 
 typedef struct {
@@ -58,6 +72,13 @@ static bool s_stage2_capture_valid = false;
 static uint8_t s_uart_cache[512];
 static size_t s_uart_cache_pos = 0u;
 static size_t s_uart_cache_len = 0u;
+
+/* Batch 1: cleanup-failure latch.  Set whenever END_SESSION cleanup runs
+   out of retries; refuses further non-clear commands so the host does not
+   start a fresh long smoke on an unresponsive bridge.  Only cleared by a
+   successful 'stage2probe clear' or by an MCU/board reset (statics
+   re-initialise on boot). */
+static bool s_stage2_fpga_stuck = false;
 
 static void ResetUartCache(void)
 {
@@ -766,13 +787,38 @@ static bool ValidateRegion0(const uint8_t data[39])
     return true;
 }
 
+static void Stage2ProbeMarkStuck(const char *context)
+{
+    s_stage2_fpga_stuck = true;
+    printf("Stage2Probe: FPGA_STUCK_NEEDS_RESET context=%s "
+           "-- END_SESSION cleanup failed; reset the board or run "
+           "'stage2probe clear' (must PASS) before further probes\n",
+           context != NULL ? context : "");
+}
+
+static bool Stage2ProbeRefuseIfStuck(const char *context)
+{
+    if (s_stage2_fpga_stuck) {
+        printf("Stage2Probe: FPGA_STUCK_NEEDS_RESET context=%s "
+               "-- previous cleanup failed; run 'stage2probe clear' "
+               "(must PASS) or reset the board first\n",
+               context != NULL ? context : "");
+        return true;
+    }
+    return false;
+}
+
 static bool EndSessionCleanup(void)
 {
     printf("Stage2Probe: sending END_SESSION cleanup\n");
     DrainRxForMs(kStage2FinalEndMs);
     ResetUartCache();
     uart_flush_input(UART_NUM_1);
-    return SendEndSessionClear("END_SESSION cleanup");
+    if (SendEndSessionClear("END_SESSION cleanup")) {
+        return true;
+    }
+    Stage2ProbeMarkStuck("END_SESSION cleanup");
+    return false;
 }
 
 static bool RunWithUartOwner(bool (*fn)(void))
@@ -941,6 +987,9 @@ static bool RunRestoreCapturedInner(void)
                                      "BEGIN_LOAD_STAGE2")) {
         goto done;
     }
+    /* Batch 1: let session_pause settle on hclk before the first
+       WRITE_STREAM_BEGIN so the bridge/loader port-A muxes are quiet. */
+    vTaskDelay(pdMS_TO_TICKS(kStage2BeginLoadSettleMs));
 
     for (size_t i = 0u; i < sizeof(kStage2Regions) / sizeof(kStage2Regions[0]); ++i) {
         size_t copy_len = 0u;
@@ -1031,14 +1080,278 @@ done:
     return ok;
 }
 
+static bool DrainUntilEndAck(const char *context)
+{
+    const int64_t deadline = esp_timer_get_time()
+                           + ((int64_t)kStage2AbortDrainBudgetMs * 1000);
+    while (esp_timer_get_time() < deadline) {
+        FusionV2Decoded_t d;
+        if (!ReadDecodedFrame(context, &d)) {
+            break;
+        }
+        if (IsEndSessionAck(&d)) {
+            printf("Stage2Probe: %s END_SESSION ACK received mid-stream\n",
+                   context);
+            return true;
+        }
+        if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
+            d.ctl_opcode == (uint8_t)kFusionOp_Error) {
+            printf("Stage2Probe: %s FPGA ERROR while draining "
+                   "code=0x%02X detail=0x%02X\n",
+                   context, d.error_code, d.error_detail);
+            return false;
+        }
+        if (d.addr == (uint8_t)kFusionAddr_StateData) {
+            printf("Stage2Probe: %s discarding stale DATA seq=%u len=%u\n",
+                   context, (unsigned)d.data_seq, (unsigned)d.data_len);
+            continue;
+        }
+        printf("Stage2Probe: %s discarding unexpected frame "
+               "addr=0x%02X op=0x%02X ack_for=0x%02X\n",
+               context, d.addr, d.ctl_opcode, d.ack_for_opcode);
+    }
+    printf("Stage2Probe: %s did NOT receive END_SESSION ACK within %u ms\n",
+           context, (unsigned)kStage2AbortDrainBudgetMs);
+    return false;
+}
+
+static bool RunAbortReadInner(void)
+{
+    bool ok = false;
+    const Stage2Region_t *region = &kStage2Regions[1]; /* WRAM */
+    uint32_t received = 0u;
+    uint32_t packets = 0u;
+    uint16_t expected_seq = 0u;
+    bool pending_data_valid = false;
+    FusionV2Decoded_t pending_data;
+    memset(&pending_data, 0, sizeof(pending_data));
+
+    DrainRxForMs(kStage2PreflightDrainMs);
+    if (!EndSessionCleanup()) {
+        goto done;
+    }
+    DrainRxForMs(kStage2PreflightDrainMs);
+
+    if (!SendStage2BeginAndExpectAck((uint8_t)kFusionOp_BeginSave,
+                                     "BEGIN_SAVE_STAGE2")) {
+        goto done;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    FusionV2Frame_t begin;
+    if (!FusionSavestate_BuildReadStreamBegin(region->region,
+                                              0u,
+                                              region->length,
+                                              &begin)) {
+        printf("Stage2Probe: build READ_STREAM_BEGIN %s failed\n",
+               region->name);
+        goto done;
+    }
+    printf("Stage2Probe: abort-read BEGIN REGION %s id=0x%02X "
+           "length=%u abort_after=%u\n",
+           region->name,
+           (unsigned)region->region,
+           (unsigned)region->length,
+           (unsigned)kStage2AbortReadPackets);
+    if (!SendFrame("READ_STREAM_BEGIN", &begin, false)) {
+        goto done;
+    }
+    if (!ExpectStreamAckOrFirstData("READ_STREAM_BEGIN ack",
+                                    (uint8_t)kFusionOp_ReadStreamBegin,
+                                    &pending_data_valid,
+                                    &pending_data)) {
+        goto done;
+    }
+
+    while (packets < (uint32_t)kStage2AbortReadPackets) {
+        FusionV2Decoded_t d;
+        if (pending_data_valid) {
+            d = pending_data;
+            pending_data_valid = false;
+        } else if (!ReadDecodedFrame("abort-read DATA", &d)) {
+            goto done;
+        }
+        if (d.addr == (uint8_t)kFusionAddr_StateCtl &&
+            d.ctl_opcode == (uint8_t)kFusionOp_Error) {
+            printf("Stage2Probe: abort-read FPGA ERROR code=0x%02X detail=0x%02X\n",
+                   d.error_code, d.error_detail);
+            goto done;
+        }
+        if (d.addr != (uint8_t)kFusionAddr_StateData) {
+            printf("Stage2Probe: abort-read expected DATA got addr=0x%02X op=0x%02X\n",
+                   d.addr, d.ctl_opcode);
+            goto done;
+        }
+        if (d.data_seq != expected_seq) {
+            printf("Stage2Probe: abort-read seq mismatch got=%u expected=%u\n",
+                   (unsigned)d.data_seq, (unsigned)expected_seq);
+            goto done;
+        }
+        received += d.data_len;
+        packets++;
+        expected_seq = (uint16_t)(expected_seq + 1u);
+
+        if (packets < (uint32_t)kStage2AbortReadPackets) {
+            FusionV2Frame_t cont;
+            if (!FusionSavestate_BuildReadStreamContinue(expected_seq,
+                                                         &cont)) {
+                printf("Stage2Probe: build READ_STREAM_CONTINUE failed seq=%u\n",
+                       (unsigned)expected_seq);
+                goto done;
+            }
+            if (!SendFrame("READ_STREAM_CONTINUE", &cont, true)) {
+                goto done;
+            }
+            if (!ExpectStreamAckOrFirstData("READ_STREAM_CONTINUE ack",
+                                            (uint8_t)kFusionOp_ReadStreamContinue,
+                                            &pending_data_valid,
+                                            &pending_data)) {
+                goto done;
+            }
+        }
+    }
+
+    printf("Stage2Probe: abort-read got packets=%u bytes=%u; "
+           "injecting END_SESSION mid-stream\n",
+           (unsigned)packets, (unsigned)received);
+
+    {
+        FusionV2Frame_t end_frame;
+        if (!FusionSavestate_BuildEndSession(&end_frame)) {
+            printf("Stage2Probe: build END_SESSION (abort) failed\n");
+            goto done;
+        }
+        if (!SendFrame("END_SESSION (abort-read)", &end_frame, false)) {
+            goto done;
+        }
+    }
+
+    if (!DrainUntilEndAck("abort-read")) {
+        goto done;
+    }
+
+    ok = true;
+
+done:
+    if (!EndSessionCleanup()) {
+        printf("Stage2Probe: ABORT-READ final cleanup failed; "
+               "treating command as FAIL\n");
+        ok = false;
+    }
+    return ok;
+}
+
+static bool RunAbortLoadInner(void)
+{
+    bool ok = false;
+    const Stage2Region_t *region = &kStage2Regions[0]; /* R0 */
+    static const uint8_t kAbortPad[8] = {
+        0x46u, 0x55u, 0x53u, 0x53u, 0x01u, 0x00u, 0x00u, 0x00u
+    };
+
+    DrainRxForMs(kStage2PreflightDrainMs);
+    if (!EndSessionCleanup()) {
+        goto done;
+    }
+    DrainRxForMs(kStage2PreflightDrainMs);
+
+    if (!SendStage2BeginAndExpectAck((uint8_t)kFusionOp_BeginLoad,
+                                     "BEGIN_LOAD_STAGE2")) {
+        goto done;
+    }
+    vTaskDelay(pdMS_TO_TICKS(kStage2BeginLoadSettleMs));
+
+    FusionV2Frame_t begin;
+    if (!FusionSavestate_BuildWriteStreamBegin(region->region,
+                                               0u,
+                                               region->length,
+                                               &begin)) {
+        printf("Stage2Probe: build WRITE_STREAM_BEGIN %s failed\n",
+               region->name);
+        goto done;
+    }
+    printf("Stage2Probe: abort-load WRITE REGION %s id=0x%02X "
+           "length=%u abort_after=%u packets\n",
+           region->name,
+           (unsigned)region->region,
+           (unsigned)region->length,
+           (unsigned)kStage2AbortLoadPackets);
+    if (!SendFrame("WRITE_STREAM_BEGIN", &begin, false)) {
+        goto done;
+    }
+    if (!ExpectCtl((uint8_t)kFusionOp_AckAccepted,
+                   (uint8_t)kFusionOp_WriteStreamBegin,
+                   "WRITE_STREAM_BEGIN ack")) {
+        goto done;
+    }
+
+    {
+        uint16_t seq = 0u;
+        for (uint8_t i = 0u;
+             i < (uint8_t)kStage2AbortLoadPackets;
+             ++i) {
+            FusionV2Frame_t data_frame;
+            if (!FusionSavestate_BuildStateData(seq,
+                                                kAbortPad,
+                                                sizeof(kAbortPad),
+                                                &data_frame)) {
+                printf("Stage2Probe: build STATE_DATA failed seq=%u\n",
+                       (unsigned)seq);
+                goto done;
+            }
+            if (!SendFrame("STATE_DATA", &data_frame, true)) {
+                goto done;
+            }
+            seq = (uint16_t)(seq + 1u);
+        }
+        printf("Stage2Probe: abort-load sent %u DATA packets; "
+               "injecting END_SESSION mid-stream\n",
+               (unsigned)kStage2AbortLoadPackets);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(kStage2AbortLoadProcessMs));
+
+    {
+        FusionV2Frame_t end_frame;
+        if (!FusionSavestate_BuildEndSession(&end_frame)) {
+            printf("Stage2Probe: build END_SESSION (abort) failed\n");
+            goto done;
+        }
+        if (!SendFrame("END_SESSION (abort-load)", &end_frame, false)) {
+            goto done;
+        }
+    }
+
+    if (!DrainUntilEndAck("abort-load")) {
+        goto done;
+    }
+
+    ok = true;
+
+done:
+    if (!EndSessionCleanup()) {
+        printf("Stage2Probe: ABORT-LOAD final cleanup failed; "
+               "treating command as FAIL\n");
+        ok = false;
+    }
+    return ok;
+}
+
 static bool RunClearInner(void)
 {
     DrainRxForMs(kStage2PreflightDrainMs);
-    return EndSessionCleanup();
+    if (EndSessionCleanup()) {
+        s_stage2_fpga_stuck = false;
+        return true;
+    }
+    return false;
 }
 
 static bool RunSaveReadback(void)
 {
+    if (Stage2ProbeRefuseIfStuck("save")) {
+        return false;
+    }
     printf("Stage2Probe: START mode=save protocol=stage2-single-byte-begin\n");
     const bool ok = RunWithUartOwner(RunSaveReadbackInner);
     printf("Stage2Probe: RESULT %s mode=save\n", ok ? "PASS" : "FAIL");
@@ -1047,6 +1360,9 @@ static bool RunSaveReadback(void)
 
 static bool RunClear(void)
 {
+    /* Intentionally NOT guarded by Stage2ProbeRefuseIfStuck -- clear is the
+       recovery command and must always run.  Successful clear is what
+       releases the stuck latch. */
     printf("Stage2Probe: START mode=clear protocol=stage2-single-byte-begin end_session_only=yes\n");
     const bool ok = RunWithUartOwner(RunClearInner);
     printf("Stage2Probe: RESULT %s mode=clear\n", ok ? "PASS" : "FAIL");
@@ -1055,6 +1371,9 @@ static bool RunClear(void)
 
 static bool RunLoadAck(void)
 {
+    if (Stage2ProbeRefuseIfStuck("load-ack")) {
+        return false;
+    }
     printf("Stage2Probe: START mode=load-ack protocol=stage2-single-byte-begin no_commit=yes\n");
     const bool ok = RunWithUartOwner(RunLoadAckInner);
     printf("Stage2Probe: RESULT %s mode=load-ack\n", ok ? "PASS" : "FAIL");
@@ -1063,6 +1382,9 @@ static bool RunLoadAck(void)
 
 static bool RunCapture(void)
 {
+    if (Stage2ProbeRefuseIfStuck("capture")) {
+        return false;
+    }
     printf("Stage2Probe: START mode=capture protocol=stage2-single-byte-begin store_in_ram=yes\n");
     const bool ok = RunWithUartOwner(RunCaptureInner);
     printf("Stage2Probe: RESULT %s mode=capture\n", ok ? "PASS" : "FAIL");
@@ -1071,6 +1393,9 @@ static bool RunCapture(void)
 
 static bool RunRestoreCaptured(void)
 {
+    if (Stage2ProbeRefuseIfStuck("restore")) {
+        return false;
+    }
     printf("Stage2Probe: START mode=restore protocol=stage2-single-byte-begin commit=yes\n");
     const bool ok = RunWithUartOwner(RunRestoreCapturedInner);
     printf("Stage2Probe: RESULT %s mode=restore\n", ok ? "PASS" : "FAIL");
@@ -1079,6 +1404,9 @@ static bool RunRestoreCaptured(void)
 
 static bool RunCaptureRestore(uint32_t delay_s)
 {
+    if (Stage2ProbeRefuseIfStuck("capture-restore")) {
+        return false;
+    }
     s_stage2_capture_restore_delay_s = delay_s;
     printf("Stage2Probe: START mode=capture-restore "
            "protocol=stage2-single-byte-begin delay_s=%lu commit=yes\n",
@@ -1086,6 +1414,30 @@ static bool RunCaptureRestore(uint32_t delay_s)
     const bool ok = RunWithUartOwner(RunCaptureRestoreInner);
     printf("Stage2Probe: RESULT %s mode=capture-restore\n",
            ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool RunAbortRead(void)
+{
+    if (Stage2ProbeRefuseIfStuck("abort-read")) {
+        return false;
+    }
+    printf("Stage2Probe: START mode=abort-read protocol=stage2-single-byte-begin "
+           "end_session_during=read_stream\n");
+    const bool ok = RunWithUartOwner(RunAbortReadInner);
+    printf("Stage2Probe: RESULT %s mode=abort-read\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool RunAbortLoad(void)
+{
+    if (Stage2ProbeRefuseIfStuck("abort-load")) {
+        return false;
+    }
+    printf("Stage2Probe: START mode=abort-load protocol=stage2-single-byte-begin "
+           "end_session_during=write_stream\n");
+    const bool ok = RunWithUartOwner(RunAbortLoadInner);
+    printf("Stage2Probe: RESULT %s mode=abort-load\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -1131,14 +1483,22 @@ static int Stage2ProbeCommand(int argc, char **argv)
         }
         return RunCaptureRestore(delay_s) ? 0 : 1;
     }
+    if (strcmp(argv[1], "abort-read") == 0) {
+        return RunAbortRead() ? 0 : 1;
+    }
+    if (strcmp(argv[1], "abort-load") == 0) {
+        return RunAbortLoad() ? 0 : 1;
+    }
 
-    printf("Usage: stage2probe [save|load-ack|clear|capture|restore|capture-restore]\n");
-    printf("  save     : BEGIN_SAVE, read R0/WRAM/HRAM, print length + CRC; no LOAD\n");
-    printf("  load-ack : BEGIN_LOAD ACK smoke only; no WRITE_STREAM, no COMMIT\n");
-    printf("  clear    : END_SESSION cleanup only; use after an aborted/failed probe\n");
-    printf("  capture  : BEGIN_SAVE, read R0/WRAM/HRAM into MCU RAM; no LOAD\n");
-    printf("  restore  : replay captured R0/WRAM/HRAM through BEGIN_LOAD, WRITE_STREAM, WRITE_COMMIT\n");
+    printf("Usage: stage2probe [save|load-ack|clear|capture|restore|capture-restore|abort-read|abort-load]\n");
+    printf("  save        : BEGIN_SAVE, read R0/WRAM/HRAM, print length + CRC; no LOAD\n");
+    printf("  load-ack    : BEGIN_LOAD ACK smoke only; no WRITE_STREAM, no COMMIT\n");
+    printf("  clear       : END_SESSION cleanup only; clears MCU stuck latch on PASS\n");
+    printf("  capture     : BEGIN_SAVE, read R0/WRAM/HRAM into MCU RAM; no LOAD\n");
+    printf("  restore     : replay captured R0/WRAM/HRAM through BEGIN_LOAD, WRITE_STREAM, WRITE_COMMIT\n");
     printf("  capture-restore <seconds> : capture, wait, restore+WRITE_COMMIT in one console command\n");
+    printf("  abort-read  : BEGIN_SAVE + READ_STREAM_BEGIN WRAM, send END_SESSION mid-stream; PASS on END ACK + released game\n");
+    printf("  abort-load  : BEGIN_LOAD + WRITE_STREAM_BEGIN R0, send END_SESSION mid-stream; PASS on END ACK + released game\n");
     return 1;
 }
 
