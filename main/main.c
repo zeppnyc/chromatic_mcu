@@ -24,6 +24,7 @@
 #include "frameblend.h"
 #include "fusion_savestate_smoke48a.h"
 #include "fusion_savestate_smoke48c.h"
+#include "fusion_savestate_stage2probe.h"
 #include "fusion_savestate_transport_probe.h"
 #include "fw.h"
 #include "osd.h"
@@ -364,8 +365,16 @@ void app_main(void)
     FusionSavestateSmoke48a_RegisterCommands();
     FusionSavestateSmoke48c_RegisterCommands();
     FusionSavestateTransportProbe_RegisterCommands();
+    FusionSavestateStage2Probe_RegisterCommands();
     // All commands must be registered prior to starting the REPL
     ESP_ERROR_CHECK(esp_console_start_repl(pRepl));
+
+    /*
+     * Chord-triggered save/load dispatcher.  The current load target is still
+     * USB-command validation; chord dispatch calls the same QuickSave /
+     * QuickLoad helpers and stays out of the restore architecture.
+     */
+    FusionSavestate_StartChordDispatcher();
 
     vTaskDelay( pdMS_TO_TICKS(2000) );
     xTaskCreate(PwrMgr_Task, "pwr_mgr_task", kSleepTask_StackDepth, NULL, kSleepTask_Priority, NULL);
