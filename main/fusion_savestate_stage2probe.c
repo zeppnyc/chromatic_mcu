@@ -840,9 +840,28 @@ static bool RunWithUartOwner(bool (*fn)(void))
 
     ok = fn();
 
+    /* UART owner can always be released: the next 'stage2probe clear'
+       still needs to acquire it to issue an END_SESSION recovery. */
     FPGA_UartOwnerRelease();
-    ResumeFpgaTraffic();
-    PwrMgr_IdleTimerResume();
+
+    /* Batch 1: gate FPGA-traffic resume on the stuck latch.  If
+       EndSessionCleanup() failed inside fn() and Stage2ProbeMarkStuck()
+       set s_stage2_fpga_stuck, the FPGA bridge is still
+       session_pause-asserted and unresponsive.  Resuming the routine
+       fpga_tx/fpga_rx tasks and the idle timer in that state would let
+       unrelated MCU<->FPGA chatter run against a paused bridge and make
+       the next failure harder to classify.  Keep them paused until
+       'stage2probe clear' returns PASS (which clears the latch and
+       reaches this exit with the latch low), or until the board is
+       reset.  The idle timer staying suspended is the safety price. */
+    if (s_stage2_fpga_stuck) {
+        printf("Stage2Probe: keeping FPGA traffic paused "
+               "(FPGA_STUCK_NEEDS_RESET); run 'stage2probe clear' until "
+               "PASS or reset the board to recover\n");
+    } else {
+        ResumeFpgaTraffic();
+        PwrMgr_IdleTimerResume();
+    }
     return ok;
 }
 
