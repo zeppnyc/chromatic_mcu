@@ -825,6 +825,19 @@ static bool RunWithUartOwner(bool (*fn)(void))
 {
     bool ok = false;
 
+    /* Batch 1 v2: PwrMgr_IdleTimerSuspend() is sticky for the whole
+       stage2probe session.  We never call PwrMgr_IdleTimerResume() in
+       this file because the idle timer's expiry (kIdleTime_ms = 100 ms,
+       pwrmgr.c) triggers PwrMgr_TriggerLightSleep -> esp_light_sleep_start
+       and the only registered wake source is PIN_NUM_UART_FROM_FPGA.
+       The console UART is NOT a wake source, so any console command sent
+       after a previous stage2probe command's PwrMgr_IdleTimerResume()
+       would have its bytes sit unread in the UART0 RX FIFO and the runner
+       would time out with no echo.  Observed on 2026-05-15 12:11 and
+       12:53 hardware runs: stage2probe clear PASS, second clear TIMEOUT,
+       MCU console unresponsive.  Cost: light sleep is disabled until the
+       next board reset.  This is acceptable for hardware validation
+       builds and gets restored on reboot. */
     PwrMgr_IdleTimerSuspend();
     PauseFpgaTraffic();
     FPGA_Rx_ResetParser();
@@ -834,7 +847,7 @@ static bool RunWithUartOwner(bool (*fn)(void))
     if (!FPGA_UartOwnerAcquire(pdMS_TO_TICKS(kStage2OwnerAcquireMs))) {
         printf("Stage2Probe: UART owner unavailable\n");
         ResumeFpgaTraffic();
-        PwrMgr_IdleTimerResume();
+        /* idle timer intentionally left suspended -- see top comment */
         return false;
     }
 
@@ -848,19 +861,17 @@ static bool RunWithUartOwner(bool (*fn)(void))
        EndSessionCleanup() failed inside fn() and Stage2ProbeMarkStuck()
        set s_stage2_fpga_stuck, the FPGA bridge is still
        session_pause-asserted and unresponsive.  Resuming the routine
-       fpga_tx/fpga_rx tasks and the idle timer in that state would let
-       unrelated MCU<->FPGA chatter run against a paused bridge and make
-       the next failure harder to classify.  Keep them paused until
-       'stage2probe clear' returns PASS (which clears the latch and
-       reaches this exit with the latch low), or until the board is
-       reset.  The idle timer staying suspended is the safety price. */
+       fpga_tx/fpga_rx tasks in that state would let unrelated
+       MCU<->FPGA chatter run against a paused bridge and make the next
+       failure harder to classify.  Keep them paused until
+       'stage2probe clear' returns PASS, or until the board is reset.
+       Idle timer is unconditionally kept suspended -- see top comment. */
     if (s_stage2_fpga_stuck) {
         printf("Stage2Probe: keeping FPGA traffic paused "
                "(FPGA_STUCK_NEEDS_RESET); run 'stage2probe clear' until "
                "PASS or reset the board to recover\n");
     } else {
         ResumeFpgaTraffic();
-        PwrMgr_IdleTimerResume();
     }
     return ok;
 }
