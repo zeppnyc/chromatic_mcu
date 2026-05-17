@@ -483,6 +483,14 @@ static void test_storage_two_phase_commit(void)
     EXPECT_EQ_U(FusionStorage_FindNewestValidSlot(&s, &newest, &newest_gen),
                 kFusionStorage_Ok);
     EXPECT_EQ_U(newest_gen, 100u);
+
+    EXPECT_EQ_U(FusionStorage_InvalidateSlot(&s, newest), kFusionStorage_Ok);
+    EXPECT_EQ_U(FusionStorage_FindNewestValidSlot(&s, &newest, &newest_gen),
+                kFusionStorage_Ok);
+    EXPECT_EQ_U(newest_gen, 42u);
+    EXPECT_EQ_U(FusionStorage_InvalidateSlot(&s, newest), kFusionStorage_Ok);
+    EXPECT_EQ_U(FusionStorage_FindNewestValidSlot(&s, &newest, &newest_gen),
+                kFusionStorage_NoValidSlot);
 }
 
 static void test_storage_partition_init_deferred(void)
@@ -492,6 +500,429 @@ static void test_storage_partition_init_deferred(void)
     EXPECT_EQ_U(FusionStorage_InitFromPartition(&s, "savestate"),
                 kFusionStorage_NotImplemented);
 }
+
+static void test_pathe_load_payload_basic(void)
+{
+    fprintf(stderr, "[test] path-e load payload basic IME=1\n");
+    FusionPathELoadInput_t s = {
+        .saved_F = 0xA0u, .saved_A = 0x7Fu,
+        .saved_C = 0x34u, .saved_B = 0x12u,
+        .saved_E = 0x78u, .saved_D = 0x56u,
+        .saved_L = 0xBCu, .saved_H = 0x9Au,
+        .saved_SP = 0xDEADu,
+        .saved_PC = 0x0150u,
+        .saved_IFF = true,
+        .halted_at_save = false,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(FusionSavestate_BuildPathELoadPayload(&s, out));
+    EXPECT_EQ_U(out[kPathE_LoadModeActive], 1u);
+    EXPECT_EQ_U(out[kPathE_ScratchF], 0xA0u);
+    EXPECT_EQ_U(out[kPathE_ScratchA], 0x7Fu);
+    EXPECT_EQ_U(out[kPathE_ScratchC], 0x34u);
+    EXPECT_EQ_U(out[kPathE_ScratchB], 0x12u);
+    EXPECT_EQ_U(out[kPathE_ScratchE], 0x78u);
+    EXPECT_EQ_U(out[kPathE_ScratchD], 0x56u);
+    EXPECT_EQ_U(out[kPathE_ScratchL], 0xBCu);
+    EXPECT_EQ_U(out[kPathE_ScratchH], 0x9Au);
+    EXPECT_EQ_U(out[kPathE_SavedSpLo], 0xADu);
+    EXPECT_EQ_U(out[kPathE_SavedSpHi], 0xDEu);
+    EXPECT_EQ_U(out[kPathE_IffByte], FUSION_PATHE_IFF_BYTE_EI);  /* 0xFB EI */
+    EXPECT_EQ_U(out[kPathE_SavedA], 0x7Fu);
+    EXPECT_EQ_U(out[kPathE_SavedPcLo], 0x50u);
+    EXPECT_EQ_U(out[kPathE_SavedPcHi], 0x01u);
+    EXPECT_EQ_U(out[kPathE_GbresetRequest], 0u);
+}
+
+static void test_pathe_load_payload_ime0(void)
+{
+    fprintf(stderr, "[test] path-e load payload IME=0 selects NOP\n");
+    FusionPathELoadInput_t s = {
+        .saved_F = 0x00u, .saved_A = 0x00u,
+        .saved_SP = 0xFFFEu, .saved_PC = 0x0150u,
+        .saved_IFF = false, .halted_at_save = false,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(FusionSavestate_BuildPathELoadPayload(&s, out));
+    EXPECT_EQ_U(out[kPathE_IffByte], FUSION_PATHE_IFF_BYTE_NOP);  /* 0x00 NOP */
+}
+
+static void test_pathe_load_payload_halt_pc_minus1(void)
+{
+    fprintf(stderr, "[test] path-e load payload HALT applies PC-1\n");
+    FusionPathELoadInput_t s = {
+        .saved_PC = 0x0234u,         /* CPU was at instruction after HALT */
+        .saved_IFF = true, .halted_at_save = true,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(FusionSavestate_BuildPathELoadPayload(&s, out));
+    /* Adjusted to 0x0233 = HALT opcode address. */
+    EXPECT_EQ_U(out[kPathE_SavedPcLo], 0x33u);
+    EXPECT_EQ_U(out[kPathE_SavedPcHi], 0x02u);
+}
+
+static void test_pathe_load_payload_rejects_pc0_halt(void)
+{
+    fprintf(stderr, "[test] path-e load payload rejects HALT at PC=0\n");
+    FusionPathELoadInput_t s = {
+        .saved_PC = 0x0000u,
+        .halted_at_save = true,
+    };
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(!FusionSavestate_BuildPathELoadPayload(&s, out));
+}
+
+static void test_pathe_load_payload_null_inputs(void)
+{
+    fprintf(stderr, "[test] path-e load payload rejects null inputs\n");
+    FusionPathELoadInput_t s = {0};
+    uint8_t out[kPathE_RegionLength];
+    EXPECT(!FusionSavestate_BuildPathELoadPayload(NULL, out));
+    EXPECT(!FusionSavestate_BuildPathELoadPayload(&s, NULL));
+}
+
+static void test_pathe_extract_from_cpu_region(void)
+{
+    fprintf(stderr, "[test] path-e extract input from saved CPU region bytes\n");
+    /* Construct a synthetic 40-byte CPU region with known field values. */
+    uint8_t cpu[40] = {0};
+    /* GBSE bytes 0-1 (don't care for this test) */
+    cpu[2] = 0x34u;  /* C */
+    cpu[3] = 0x78u;  /* E */
+    cpu[4] = 0xBCu;  /* L */
+    cpu[6] = 0x12u;  /* B */
+    cpu[7] = 0x56u;  /* D */
+    cpu[8] = 0x9Au;  /* H */
+    cpu[10] = 0x50u; /* PC lo */
+    cpu[11] = 0x01u; /* PC hi */
+    cpu[19] = 0x7Fu; /* ACC = visible A */
+    cpu[25] = 0xADu; /* SP lo */
+    cpu[26] = 0xDEu; /* SP hi */
+    /*
+     * F = 0xA0 means Z=1, N=0, H=1, C=0; encoded in byte 28:
+     *   F[7]=Z=1 -> bit 4 of byte28 = 1
+     *   F[6]=N=0 -> bit 3 of byte28 = 0
+     *   F[5]=H=1 -> bit 2 of byte28 = 1
+     *   F[4]=C=0 -> bit 1 of byte28 = 0
+     * byte28 lower 5 bits = 0b10100 = 0x14
+     */
+    cpu[28] = 0x14u;
+    cpu[31] = 0x10u;  /* IFF=1 (bit 4), Halt=0 (bit 0) */
+
+    FusionPathELoadInput_t state = {0};
+    EXPECT(FusionSavestate_ExtractPathELoadInputFromCpuRegion(cpu, sizeof(cpu), &state));
+    EXPECT_EQ_U(state.saved_C, 0x34u);
+    EXPECT_EQ_U(state.saved_E, 0x78u);
+    EXPECT_EQ_U(state.saved_L, 0xBCu);
+    EXPECT_EQ_U(state.saved_B, 0x12u);
+    EXPECT_EQ_U(state.saved_D, 0x56u);
+    EXPECT_EQ_U(state.saved_H, 0x9Au);
+    EXPECT_EQ_U(state.saved_A, 0x7Fu);
+    EXPECT_EQ_U(state.saved_F, 0xA0u);
+    EXPECT_EQ_U(state.saved_PC, 0x0150u);
+    EXPECT_EQ_U(state.saved_SP, 0xDEADu);
+    EXPECT(state.saved_IFF);
+    EXPECT(!state.halted_at_save);
+
+    /* Halt scenario: byte 31 bit 0 = 1, IFF still 1 */
+    cpu[31] = 0x11u;
+    EXPECT(FusionSavestate_ExtractPathELoadInputFromCpuRegion(cpu, sizeof(cpu), &state));
+    EXPECT(state.halted_at_save);
+    EXPECT(state.saved_IFF);
+}
+
+static void test_pathe_extract_rejects_short_input(void)
+{
+    fprintf(stderr, "[test] path-e extract rejects short input\n");
+    uint8_t cpu[16] = {0};
+    FusionPathELoadInput_t state = {0};
+    EXPECT(!FusionSavestate_ExtractPathELoadInputFromCpuRegion(cpu, sizeof(cpu), &state));
+    EXPECT(!FusionSavestate_ExtractPathELoadInputFromCpuRegion(NULL, 40, &state));
+}
+
+static void test_cart_feature_classification(void)
+{
+    fprintf(stderr, "[test] cart feature classification gates supported classes\n");
+
+    FusionCartFeatureInfo_t info = FusionSavestate_ClassifyCartType(0x00u);
+    EXPECT_EQ_U(info.support, kFusionCartSupport_Supported);
+    EXPECT_EQ_U(info.cart_class, kFusionCartClass_RomOnly);
+    EXPECT(FusionSavestate_CartTypeSupported(0x00u));
+
+    info = FusionSavestate_ClassifyCartType(0x03u);
+    EXPECT_EQ_U(info.support, kFusionCartSupport_Supported);
+    EXPECT_EQ_U(info.cart_class, kFusionCartClass_Mbc1);
+
+    info = FusionSavestate_ClassifyCartType(0x13u);
+    EXPECT_EQ_U(info.support, kFusionCartSupport_Supported);
+    EXPECT_EQ_U(info.cart_class, kFusionCartClass_Mbc3NoRtc);
+
+    info = FusionSavestate_ClassifyCartType(0x1Bu);
+    EXPECT_EQ_U(info.support, kFusionCartSupport_Supported);
+    EXPECT_EQ_U(info.cart_class, kFusionCartClass_Mbc5NoSpecial);
+
+    EXPECT_EQ_U(FusionSavestate_ClassifyCartType(0x10u).support,
+                kFusionCartSupport_UnsupportedRtc);
+    EXPECT_EQ_U(FusionSavestate_ClassifyCartType(0x1Eu).support,
+                kFusionCartSupport_UnsupportedRumble);
+    EXPECT_EQ_U(FusionSavestate_ClassifyCartType(0xFCu).support,
+                kFusionCartSupport_UnsupportedCamera);
+    EXPECT_EQ_U(FusionSavestate_ClassifyCartType(0x22u).support,
+                kFusionCartSupport_UnsupportedAccelerometer);
+    EXPECT_EQ_U(FusionSavestate_ClassifyCartType(0xFEu).support,
+                kFusionCartSupport_UnsupportedIrSpecial);
+    EXPECT(!FusionSavestate_CartTypeSupported(0x20u));
+    EXPECT(strcmp(FusionSavestate_CartSupportReason(kFusionCartSupport_Supported),
+                  "supported") == 0);
+}
+
+/* --- Full per-header-type matrix for the 2026-05-17 cart feature gate. --- */
+
+typedef struct {
+    uint8_t              cart_type;
+    FusionCartClass_t    cart_class;
+    FusionCartSupport_t  support;
+    uint32_t             feature_flags;     /* exact required bitset */
+    bool                 supported;
+    bool                 requires_cart_state;
+    const char          *class_name;
+    const char          *support_token;
+} CartCase_t;
+
+static void test_cart_feature_classification_matrix(void)
+{
+    fprintf(stderr, "[test] cart feature classification full per-header matrix\n");
+
+    static const CartCase_t cases[] = {
+        /* Supported classes. */
+        { 0x00u, kFusionCartClass_RomOnly,       kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_ROM_ONLY,
+          true, false, "ROM_ONLY", "ALLOW_SUPPORTED" },
+        { 0x01u, kFusionCartClass_Mbc1,          kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC1,
+          true, true,  "MBC1",     "ALLOW_SUPPORTED" },
+        { 0x02u, kFusionCartClass_Mbc1,          kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC1,
+          true, true,  "MBC1",     "ALLOW_SUPPORTED" },
+        { 0x03u, kFusionCartClass_Mbc1,          kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC1,
+          true, true,  "MBC1",     "ALLOW_SUPPORTED" },
+        { 0x11u, kFusionCartClass_Mbc3NoRtc,     kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC3,
+          true, true,  "MBC3",     "ALLOW_SUPPORTED" },
+        { 0x12u, kFusionCartClass_Mbc3NoRtc,     kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC3,
+          true, true,  "MBC3",     "ALLOW_SUPPORTED" },
+        { 0x13u, kFusionCartClass_Mbc3NoRtc,     kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC3,
+          true, true,  "MBC3",     "ALLOW_SUPPORTED" },
+        { 0x19u, kFusionCartClass_Mbc5NoSpecial, kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC5,
+          true, true,  "MBC5",     "ALLOW_SUPPORTED" },
+        { 0x1Au, kFusionCartClass_Mbc5NoSpecial, kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC5,
+          true, true,  "MBC5",     "ALLOW_SUPPORTED" },
+        { 0x1Bu, kFusionCartClass_Mbc5NoSpecial, kFusionCartSupport_Supported,
+          FUSION_CART_FLAG_MBC5,
+          true, true,  "MBC5",     "ALLOW_SUPPORTED" },
+
+        /* Refused classes. */
+        { 0x0Fu, kFusionCartClass_Mbc3WithRtc,    kFusionCartSupport_UnsupportedRtc,
+          FUSION_CART_FLAG_MBC3 | FUSION_CART_FLAG_RTC,
+          false, false, "MBC3_RTC",     "REJECT_RTC" },
+        { 0x10u, kFusionCartClass_Mbc3WithRtc,    kFusionCartSupport_UnsupportedRtc,
+          FUSION_CART_FLAG_MBC3 | FUSION_CART_FLAG_RTC,
+          false, false, "MBC3_RTC",     "REJECT_RTC" },
+        { 0x1Cu, kFusionCartClass_Mbc5WithRumble, kFusionCartSupport_UnsupportedRumble,
+          FUSION_CART_FLAG_MBC5 | FUSION_CART_FLAG_RUMBLE,
+          false, false, "MBC5_RUMBLE",  "REJECT_RUMBLE" },
+        { 0x1Du, kFusionCartClass_Mbc5WithRumble, kFusionCartSupport_UnsupportedRumble,
+          FUSION_CART_FLAG_MBC5 | FUSION_CART_FLAG_RUMBLE,
+          false, false, "MBC5_RUMBLE",  "REJECT_RUMBLE" },
+        { 0x1Eu, kFusionCartClass_Mbc5WithRumble, kFusionCartSupport_UnsupportedRumble,
+          FUSION_CART_FLAG_MBC5 | FUSION_CART_FLAG_RUMBLE,
+          false, false, "MBC5_RUMBLE",  "REJECT_RUMBLE" },
+        { 0x20u, kFusionCartClass_Mbc6,           kFusionCartSupport_UnsupportedMbc6,
+          FUSION_CART_FLAG_MBC6,
+          false, false, "MBC6",         "REJECT_MBC6" },
+        { 0x22u, kFusionCartClass_Mbc7Accel,      kFusionCartSupport_UnsupportedAccelerometer,
+          FUSION_CART_FLAG_MBC7 | FUSION_CART_FLAG_ACCELEROMETER,
+          false, false, "MBC7_ACCEL",   "REJECT_ACCELEROMETER" },
+        { 0xFCu, kFusionCartClass_PocketCamera,   kFusionCartSupport_UnsupportedCamera,
+          FUSION_CART_FLAG_CAMERA,
+          false, false, "POCKET_CAMERA","REJECT_CAMERA" },
+        { 0xFEu, kFusionCartClass_HuC3,           kFusionCartSupport_UnsupportedIrSpecial,
+          FUSION_CART_FLAG_HUC | FUSION_CART_FLAG_IR_SPECIAL,
+          false, false, "HUC3",         "REJECT_IR_SPECIAL" },
+        { 0xFFu, kFusionCartClass_HuC1IrBattery,  kFusionCartSupport_UnsupportedIrSpecial,
+          FUSION_CART_FLAG_HUC | FUSION_CART_FLAG_IR_SPECIAL,
+          false, false, "HUC1_IR_BATTERY", "REJECT_IR_SPECIAL" },
+
+        /* A representative sample of unclassified types. */
+        { 0x04u, kFusionCartClass_Unsupported,    kFusionCartSupport_UnsupportedMapper,
+          FUSION_CART_FLAG_UNKNOWN_MAPPER,
+          false, false, "UNKNOWN_MAPPER", "REJECT_UNKNOWN_MAPPER" },
+        { 0x05u, kFusionCartClass_Unsupported,    kFusionCartSupport_UnsupportedMapper,
+          FUSION_CART_FLAG_UNKNOWN_MAPPER,
+          false, false, "UNKNOWN_MAPPER", "REJECT_UNKNOWN_MAPPER" },
+        { 0x21u, kFusionCartClass_Unsupported,    kFusionCartSupport_UnsupportedMapper,
+          FUSION_CART_FLAG_UNKNOWN_MAPPER,
+          false, false, "UNKNOWN_MAPPER", "REJECT_UNKNOWN_MAPPER" },
+        { 0xFDu, kFusionCartClass_Unsupported,    kFusionCartSupport_UnsupportedMapper,
+          FUSION_CART_FLAG_UNKNOWN_MAPPER,
+          false, false, "UNKNOWN_MAPPER", "REJECT_UNKNOWN_MAPPER" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const CartCase_t *c = &cases[i];
+        FusionCartFeatureInfo_t info =
+            FusionSavestate_ClassifyCartType(c->cart_type);
+
+        EXPECT_EQ_U(info.cart_type,          c->cart_type);
+        EXPECT_EQ_U(info.cart_class,         c->cart_class);
+        EXPECT_EQ_U(info.support,            c->support);
+        EXPECT_EQ_U(info.feature_flags,      c->feature_flags);
+        EXPECT_EQ_U((uint8_t)info.supported, (uint8_t)c->supported);
+        EXPECT_EQ_U((uint8_t)info.requires_cart_state,
+                    (uint8_t)c->requires_cart_state);
+        EXPECT_EQ_U((uint8_t)FusionSavestate_CartTypeSupported(c->cart_type),
+                    (uint8_t)c->supported);
+
+        const char *name  = FusionSavestate_CartClassName(info.cart_class);
+        const char *token = FusionSavestate_CartSupportToken(info.support);
+        EXPECT(name  != NULL && strcmp(name,  c->class_name)    == 0);
+        EXPECT(token != NULL && strcmp(token, c->support_token) == 0);
+
+        FusionCartLoadGate_t gate =
+            FusionSavestate_EvaluateCartLoadGate(c->cart_type);
+        EXPECT_EQ_U((uint8_t)gate.allow_load, (uint8_t)c->supported);
+        EXPECT_EQ_U(gate.info.cart_class, c->cart_class);
+        EXPECT_EQ_U(gate.info.support,    c->support);
+        EXPECT(gate.reject_token != NULL &&
+               strcmp(gate.reject_token, c->support_token) == 0);
+        EXPECT(gate.message != NULL);
+        /* The human-readable reason must agree with the support enum text. */
+        EXPECT(gate.message ==
+               FusionSavestate_CartSupportReason(gate.info.support));
+    }
+}
+
+/*
+ * Distinguishability checks: the spec calls out two MBC pairs that must NOT be
+ * collapsed.  Each pair shares the parent mapper feature but differs only in
+ * RTC/rumble presence, so the classifier must keep them on different support
+ * tracks and different class names.
+ */
+static void test_cart_feature_distinguishes_mbc3_rtc_vs_no_rtc(void)
+{
+    fprintf(stderr, "[test] cart classifier distinguishes MBC3 RTC vs MBC3 no-RTC\n");
+
+    FusionCartFeatureInfo_t no_rtc = FusionSavestate_ClassifyCartType(0x13u);
+    FusionCartFeatureInfo_t rtc    = FusionSavestate_ClassifyCartType(0x10u);
+
+    EXPECT(no_rtc.supported);
+    EXPECT(!rtc.supported);
+    EXPECT_EQ_U(no_rtc.cart_class, kFusionCartClass_Mbc3NoRtc);
+    EXPECT_EQ_U(rtc.cart_class,    kFusionCartClass_Mbc3WithRtc);
+    /* Both must carry the MBC3 family flag. */
+    EXPECT_EQ_U(no_rtc.feature_flags & FUSION_CART_FLAG_MBC3, FUSION_CART_FLAG_MBC3);
+    EXPECT_EQ_U(rtc.feature_flags    & FUSION_CART_FLAG_MBC3, FUSION_CART_FLAG_MBC3);
+    /* RTC bit must be set only on the RTC variant. */
+    EXPECT_EQ_U(no_rtc.feature_flags & FUSION_CART_FLAG_RTC, 0u);
+    EXPECT_EQ_U(rtc.feature_flags    & FUSION_CART_FLAG_RTC, FUSION_CART_FLAG_RTC);
+
+    EXPECT(strcmp(FusionSavestate_CartSupportToken(no_rtc.support),
+                  "ALLOW_SUPPORTED") == 0);
+    EXPECT(strcmp(FusionSavestate_CartSupportToken(rtc.support),
+                  "REJECT_RTC") == 0);
+}
+
+static void test_cart_feature_distinguishes_mbc5_rumble_vs_no_rumble(void)
+{
+    fprintf(stderr, "[test] cart classifier distinguishes MBC5 rumble vs MBC5 no-rumble\n");
+
+    FusionCartFeatureInfo_t no_rumble = FusionSavestate_ClassifyCartType(0x1Bu);
+    FusionCartFeatureInfo_t rumble    = FusionSavestate_ClassifyCartType(0x1Eu);
+
+    EXPECT(no_rumble.supported);
+    EXPECT(!rumble.supported);
+    EXPECT_EQ_U(no_rumble.cart_class, kFusionCartClass_Mbc5NoSpecial);
+    EXPECT_EQ_U(rumble.cart_class,    kFusionCartClass_Mbc5WithRumble);
+    EXPECT_EQ_U(no_rumble.feature_flags & FUSION_CART_FLAG_MBC5,    FUSION_CART_FLAG_MBC5);
+    EXPECT_EQ_U(rumble.feature_flags    & FUSION_CART_FLAG_MBC5,    FUSION_CART_FLAG_MBC5);
+    EXPECT_EQ_U(no_rumble.feature_flags & FUSION_CART_FLAG_RUMBLE,  0u);
+    EXPECT_EQ_U(rumble.feature_flags    & FUSION_CART_FLAG_RUMBLE,  FUSION_CART_FLAG_RUMBLE);
+
+    EXPECT(strcmp(FusionSavestate_CartSupportToken(no_rumble.support),
+                  "ALLOW_SUPPORTED") == 0);
+    EXPECT(strcmp(FusionSavestate_CartSupportToken(rumble.support),
+                  "REJECT_RUMBLE") == 0);
+}
+
+static void test_cart_load_gate_refuses_all_unsupported(void)
+{
+    fprintf(stderr, "[test] cart load gate refuses every unsupported header type\n");
+
+    static const uint8_t refused[] = {
+        0x0Fu, 0x10u,                  /* MBC3 RTC */
+        0x1Cu, 0x1Du, 0x1Eu,           /* MBC5 rumble */
+        0x20u,                         /* MBC6 */
+        0x22u,                         /* MBC7 accelerometer */
+        0xFCu,                         /* Pocket Camera */
+        0xFEu, 0xFFu,                  /* HuC3 / HuC1+IR+Battery */
+        /* Sample of unclassified types. */
+        0x04u, 0x05u, 0x06u, 0x07u,
+        0x08u, 0x09u, 0x0Au, 0x0Bu,
+        0x0Cu, 0x0Du, 0x0Eu, 0x14u,
+        0x15u, 0x16u, 0x17u, 0x18u,
+        0x1Fu, 0x21u, 0x23u, 0xFDu,
+        0xA0u, 0xCCu,
+    };
+
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        const uint8_t t = refused[i];
+        FusionCartLoadGate_t gate = FusionSavestate_EvaluateCartLoadGate(t);
+        EXPECT(!gate.allow_load);
+        EXPECT(gate.info.supported == false);
+        EXPECT(gate.info.requires_cart_state == false);
+        EXPECT(gate.reject_token != NULL);
+        /* No refused entry may use the ALLOW token. */
+        EXPECT(strcmp(gate.reject_token, "ALLOW_SUPPORTED") != 0);
+        /* No refused entry may carry the ROM_ONLY family flag. */
+        EXPECT_EQ_U(gate.info.feature_flags & FUSION_CART_FLAG_ROM_ONLY, 0u);
+    }
+}
+
+static void test_cart_load_gate_allows_supported_subset(void)
+{
+    fprintf(stderr, "[test] cart load gate allows every supported header type\n");
+
+    static const uint8_t allowed[] = {
+        0x00u,
+        0x01u, 0x02u, 0x03u,
+        0x11u, 0x12u, 0x13u,
+        0x19u, 0x1Au, 0x1Bu,
+    };
+
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
+        const uint8_t t = allowed[i];
+        FusionCartLoadGate_t gate = FusionSavestate_EvaluateCartLoadGate(t);
+        EXPECT(gate.allow_load);
+        EXPECT(gate.info.supported);
+        EXPECT(gate.reject_token != NULL &&
+               strcmp(gate.reject_token, "ALLOW_SUPPORTED") == 0);
+        /* ROM_ONLY does not need cart/MBC state; every other supported class does. */
+        if (t == 0x00u) {
+            EXPECT(!gate.info.requires_cart_state);
+        } else {
+            EXPECT(gate.info.requires_cart_state);
+        }
+    }
+}
+
+/* PathE product package gate selftests live in fusion_pathe_pkg_selftest.c.
+ * It folds its pass/fail counts into the values passed in. */
+void RunFusionPathePkgSelftests(int *pass_out, int *fail_out);
 
 int main(void)
 {
@@ -511,6 +942,22 @@ int main(void)
     test_storage_header_layout();
     test_storage_two_phase_commit();
     test_storage_partition_init_deferred();
+    test_pathe_load_payload_basic();
+    test_pathe_load_payload_ime0();
+    test_pathe_load_payload_halt_pc_minus1();
+    test_pathe_load_payload_rejects_pc0_halt();
+    test_pathe_load_payload_null_inputs();
+    test_pathe_extract_from_cpu_region();
+    test_pathe_extract_rejects_short_input();
+    test_cart_feature_classification();
+    test_cart_feature_classification_matrix();
+    test_cart_feature_distinguishes_mbc3_rtc_vs_no_rtc();
+    test_cart_feature_distinguishes_mbc5_rumble_vs_no_rumble();
+    test_cart_load_gate_refuses_all_unsupported();
+    test_cart_load_gate_allows_supported_subset();
+
+    /* PathE product package gate (preparatory; no FPGA dependency). */
+    RunFusionPathePkgSelftests(&g_pass_count, &g_fail_count);
 
     fprintf(stderr, "\n%d passed, %d failed\n", g_pass_count, g_fail_count);
     return g_fail_count == 0 ? 0 : 1;

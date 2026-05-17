@@ -17,8 +17,10 @@ SRCS := \
   $(MAIN)/fusion_savestate.c \
   $(MAIN)/fpga_state_port.c \
   $(MAIN)/savestate_storage.c \
+  $(MAIN)/fusion_pathe_pkg.c \
   $(CRC)/crc8_sae_j1850.c \
-  fusion_savestate_selftest.c
+  fusion_savestate_selftest.c \
+  fusion_pathe_pkg_selftest.c
 
 BUILD := build
 BIN   := $(BUILD)/fusion_savestate_selftest

@@ -302,3 +302,322 @@ uint32_t FusionSavestate_ComputeGameIdV1(const uint8_t rom_header[FUSION_ROM_HEA
     }
     return FusionSavestate_Crc32(rom_header, FUSION_ROM_HEADER_BYTES);
 }
+
+FusionCartFeatureInfo_t FusionSavestate_ClassifyCartType(uint8_t cart_type)
+{
+    FusionCartFeatureInfo_t info;
+    info.cart_type = cart_type;
+    info.cart_class = kFusionCartClass_Unsupported;
+    info.support = kFusionCartSupport_UnsupportedMapper;
+    info.feature_flags = FUSION_CART_FLAG_UNKNOWN_MAPPER;
+    info.requires_cart_state = false;
+    info.supported = false;
+
+    switch (cart_type) {
+    case 0x00u:
+        info.cart_class = kFusionCartClass_RomOnly;
+        info.support = kFusionCartSupport_Supported;
+        info.feature_flags = FUSION_CART_FLAG_ROM_ONLY;
+        /* ROM_ONLY never needs a cart/MBC scalar region. */
+        info.requires_cart_state = false;
+        break;
+
+    case 0x01u:
+    case 0x02u:
+    case 0x03u:
+        info.cart_class = kFusionCartClass_Mbc1;
+        info.support = kFusionCartSupport_Supported;
+        info.feature_flags = FUSION_CART_FLAG_MBC1;
+        info.requires_cart_state = true;
+        break;
+
+    case 0x0Fu:
+    case 0x10u:
+        info.cart_class = kFusionCartClass_Mbc3WithRtc;
+        info.support = kFusionCartSupport_UnsupportedRtc;
+        info.feature_flags = FUSION_CART_FLAG_MBC3 | FUSION_CART_FLAG_RTC;
+        break;
+
+    case 0x11u:
+    case 0x12u:
+    case 0x13u:
+        info.cart_class = kFusionCartClass_Mbc3NoRtc;
+        info.support = kFusionCartSupport_Supported;
+        info.feature_flags = FUSION_CART_FLAG_MBC3;
+        info.requires_cart_state = true;
+        break;
+
+    case 0x19u:
+    case 0x1Au:
+    case 0x1Bu:
+        info.cart_class = kFusionCartClass_Mbc5NoSpecial;
+        info.support = kFusionCartSupport_Supported;
+        info.feature_flags = FUSION_CART_FLAG_MBC5;
+        info.requires_cart_state = true;
+        break;
+
+    case 0x1Cu:
+    case 0x1Du:
+    case 0x1Eu:
+        info.cart_class = kFusionCartClass_Mbc5WithRumble;
+        info.support = kFusionCartSupport_UnsupportedRumble;
+        info.feature_flags = FUSION_CART_FLAG_MBC5 | FUSION_CART_FLAG_RUMBLE;
+        break;
+
+    case 0x20u:
+        info.cart_class = kFusionCartClass_Mbc6;
+        info.support = kFusionCartSupport_UnsupportedMbc6;
+        info.feature_flags = FUSION_CART_FLAG_MBC6;
+        break;
+
+    case 0x22u:
+        info.cart_class = kFusionCartClass_Mbc7Accel;
+        info.support = kFusionCartSupport_UnsupportedAccelerometer;
+        info.feature_flags = FUSION_CART_FLAG_MBC7 |
+                             FUSION_CART_FLAG_ACCELEROMETER;
+        break;
+
+    case 0xFCu:
+        info.cart_class = kFusionCartClass_PocketCamera;
+        info.support = kFusionCartSupport_UnsupportedCamera;
+        info.feature_flags = FUSION_CART_FLAG_CAMERA;
+        break;
+
+    case 0xFEu:
+        info.cart_class = kFusionCartClass_HuC3;
+        info.support = kFusionCartSupport_UnsupportedIrSpecial;
+        info.feature_flags = FUSION_CART_FLAG_HUC |
+                             FUSION_CART_FLAG_IR_SPECIAL;
+        break;
+
+    case 0xFFu:
+        info.cart_class = kFusionCartClass_HuC1IrBattery;
+        info.support = kFusionCartSupport_UnsupportedIrSpecial;
+        info.feature_flags = FUSION_CART_FLAG_HUC |
+                             FUSION_CART_FLAG_IR_SPECIAL;
+        break;
+
+    default:
+        /* Any unclassified header type is treated as unknown/special mapper. */
+        break;
+    }
+
+    info.supported = (info.support == kFusionCartSupport_Supported);
+    return info;
+}
+
+bool FusionSavestate_CartTypeSupported(uint8_t cart_type)
+{
+    return FusionSavestate_ClassifyCartType(cart_type).supported;
+}
+
+const char *FusionSavestate_CartSupportReason(FusionCartSupport_t support)
+{
+    switch (support) {
+    case kFusionCartSupport_Supported:
+        return "supported";
+    case kFusionCartSupport_UnsupportedRtc:
+        return "RTC cartridges are not supported by this save/load build";
+    case kFusionCartSupport_UnsupportedRumble:
+        return "rumble/special MBC5 cartridges are not supported by this save/load build";
+    case kFusionCartSupport_UnsupportedCamera:
+        return "camera cartridges are not supported by this save/load build";
+    case kFusionCartSupport_UnsupportedAccelerometer:
+        return "accelerometer cartridges are not supported by this save/load build";
+    case kFusionCartSupport_UnsupportedIrSpecial:
+        return "IR-special cartridges are not supported by this save/load build";
+    case kFusionCartSupport_UnsupportedMbc6:
+        return "MBC6 cartridges are not supported by this save/load build";
+    case kFusionCartSupport_UnsupportedMapper:
+    default:
+        return "unknown or unsupported mapper";
+    }
+}
+
+const char *FusionSavestate_CartSupportToken(FusionCartSupport_t support)
+{
+    switch (support) {
+    case kFusionCartSupport_Supported:
+        return "ALLOW_SUPPORTED";
+    case kFusionCartSupport_UnsupportedRtc:
+        return "REJECT_RTC";
+    case kFusionCartSupport_UnsupportedRumble:
+        return "REJECT_RUMBLE";
+    case kFusionCartSupport_UnsupportedCamera:
+        return "REJECT_CAMERA";
+    case kFusionCartSupport_UnsupportedAccelerometer:
+        return "REJECT_ACCELEROMETER";
+    case kFusionCartSupport_UnsupportedIrSpecial:
+        return "REJECT_IR_SPECIAL";
+    case kFusionCartSupport_UnsupportedMbc6:
+        return "REJECT_MBC6";
+    case kFusionCartSupport_UnsupportedMapper:
+    default:
+        return "REJECT_UNKNOWN_MAPPER";
+    }
+}
+
+const char *FusionSavestate_CartClassName(FusionCartClass_t cls)
+{
+    switch (cls) {
+    case kFusionCartClass_RomOnly:        return "ROM_ONLY";
+    case kFusionCartClass_Mbc1:           return "MBC1";
+    case kFusionCartClass_Mbc3NoRtc:      return "MBC3";
+    case kFusionCartClass_Mbc5NoSpecial:  return "MBC5";
+    case kFusionCartClass_Mbc3WithRtc:    return "MBC3_RTC";
+    case kFusionCartClass_Mbc5WithRumble: return "MBC5_RUMBLE";
+    case kFusionCartClass_Mbc6:           return "MBC6";
+    case kFusionCartClass_Mbc7Accel:      return "MBC7_ACCEL";
+    case kFusionCartClass_PocketCamera:   return "POCKET_CAMERA";
+    case kFusionCartClass_HuC3:           return "HUC3";
+    case kFusionCartClass_HuC1IrBattery:  return "HUC1_IR_BATTERY";
+    case kFusionCartClass_Unsupported:
+    default:                              return "UNKNOWN_MAPPER";
+    }
+}
+
+FusionCartLoadGate_t FusionSavestate_EvaluateCartLoadGate(uint8_t cart_type)
+{
+    FusionCartLoadGate_t gate;
+    gate.info = FusionSavestate_ClassifyCartType(cart_type);
+    gate.allow_load = gate.info.supported;
+    gate.reject_token = FusionSavestate_CartSupportToken(gate.info.support);
+    gate.message = FusionSavestate_CartSupportReason(gate.info.support);
+    return gate;
+}
+
+/*
+ * CPU region (region 0x02) saved-slot byte offsets per FPGA mapping
+ * (verified against T80.vhd, T80_Reg.vhd, GBse.vhd):
+ *
+ *   offset 0-1   GBSE state
+ *   offset 2-9   T80_Reg CPUREGS file (RegsL/H 0-3)
+ *     2: RegsL(0) = C
+ *     3: RegsL(1) = E
+ *     4: RegsL(2) = L
+ *     5: RegsL(3) = unused (GB only uses 0-2 of L bank)
+ *     6: RegsH(0) = B
+ *     7: RegsH(1) = D
+ *     8: RegsH(2) = H
+ *     9: RegsH(3) = unused
+ *   offset 10-17 T80 SS_1
+ *     10-11: PC (lo, hi)
+ *     12-13: address bus latch (NOT visible A)
+ *   offset 18-24 T80 SS_2
+ *     19: SS_2[15:8] = ACC (visible A)
+ *   offset 25-32 T80 SS_3
+ *     25-26: SP (lo, hi)
+ *     27: SS_3[23:16] = Read_To_Reg_r + low F bits (always 0 in GB mode)
+ *     28: SS_3[31:24] - bits 4-1 = F[7:4] = Z/N/H/C; bits 7-5 = Arith16_r etc
+ *     31: SS_3[55:48] - bit 0 = Halt_FF, bit 4 = IntE_FF1 (saved_IFF)
+ *   offset 33-39 T80 SS_4 (RegBus/Bus latches, not used by legacy PathE-stub)
+ *
+ * F register: GB mode T80 hardware-clamps F[3:0]=0 (T80.vhd line 897-899).
+ * Non-byte-aligned extraction:
+ *   F[7] = byte28 bit 4 (Z)
+ *   F[6] = byte28 bit 3 (N)
+ *   F[5] = byte28 bit 2 (H)
+ *   F[4] = byte28 bit 1 (C)
+ *   F[3:0] = 0
+ *   => F = (byte28 << 3) & 0xF0
+ */
+#define PATHE_CPU_REGION_MIN_BYTES  32u
+#define PATHE_CPU_OFF_C             2u
+#define PATHE_CPU_OFF_E             3u
+#define PATHE_CPU_OFF_L             4u
+#define PATHE_CPU_OFF_B             6u
+#define PATHE_CPU_OFF_D             7u
+#define PATHE_CPU_OFF_H             8u
+#define PATHE_CPU_OFF_PC_LO         10u
+#define PATHE_CPU_OFF_PC_HI         11u
+#define PATHE_CPU_OFF_ACC           19u
+#define PATHE_CPU_OFF_SP_LO         25u
+#define PATHE_CPU_OFF_SP_HI         26u
+#define PATHE_CPU_OFF_F_BYTE        28u
+#define PATHE_CPU_OFF_HALT_IFF_BYTE 31u
+#define PATHE_HALT_FF_BIT           0x01u
+#define PATHE_IFF_FF1_BIT           0x10u  /* SS_3[52] = bit 4 of byte 31 */
+
+bool FusionSavestate_ExtractPathELoadInputFromCpuRegion(
+    const uint8_t *cpu_region_bytes,
+    size_t cpu_region_len,
+    FusionPathELoadInput_t *out)
+{
+    if (cpu_region_bytes == NULL || out == NULL) {
+        return false;
+    }
+    if (cpu_region_len < PATHE_CPU_REGION_MIN_BYTES) {
+        return false;
+    }
+
+    out->saved_C = cpu_region_bytes[PATHE_CPU_OFF_C];
+    out->saved_E = cpu_region_bytes[PATHE_CPU_OFF_E];
+    out->saved_L = cpu_region_bytes[PATHE_CPU_OFF_L];
+    out->saved_B = cpu_region_bytes[PATHE_CPU_OFF_B];
+    out->saved_D = cpu_region_bytes[PATHE_CPU_OFF_D];
+    out->saved_H = cpu_region_bytes[PATHE_CPU_OFF_H];
+
+    out->saved_A = cpu_region_bytes[PATHE_CPU_OFF_ACC];
+
+    /* F: extract bits Z/N/H/C from byte28 bits 4-1, F[3:0]=0 */
+    const uint8_t byte28 = cpu_region_bytes[PATHE_CPU_OFF_F_BYTE];
+    out->saved_F = (uint8_t)((byte28 << 3) & 0xF0u);
+
+    out->saved_PC = (uint16_t)(cpu_region_bytes[PATHE_CPU_OFF_PC_LO] |
+                               ((uint16_t)cpu_region_bytes[PATHE_CPU_OFF_PC_HI] << 8));
+    out->saved_SP = (uint16_t)(cpu_region_bytes[PATHE_CPU_OFF_SP_LO] |
+                               ((uint16_t)cpu_region_bytes[PATHE_CPU_OFF_SP_HI] << 8));
+
+    const uint8_t halt_iff_byte = cpu_region_bytes[PATHE_CPU_OFF_HALT_IFF_BYTE];
+    out->halted_at_save = (halt_iff_byte & PATHE_HALT_FF_BIT) != 0u;
+    out->saved_IFF      = (halt_iff_byte & PATHE_IFF_FF1_BIT) != 0u;
+
+    return true;
+}
+
+bool FusionSavestate_BuildPathELoadPayload(const FusionPathELoadInput_t *state,
+                                            uint8_t out[kPathE_RegionLength])
+{
+    if (state == NULL || out == NULL) {
+        return false;
+    }
+
+    /*
+     * HALT-during-save adjustment per Gate 1 contract §4:
+     *   if Halt_FF=1 at save time, saved_PC := captured_PC - 1
+     * so the CPU re-executes the HALT opcode and naturally re-enters
+     * HALT mode on load.
+     *
+     * Reject the (rare) case where halted_at_save=true and saved_PC=0
+     * since PC-1 would underflow.  A real GB cannot be in HALT at
+     * PC=$0000 in practice, but explicit rejection is safer than
+     * letting the load proceed with PC=$FFFF (cart bus high region).
+     */
+    uint16_t adjusted_pc = state->saved_PC;
+    if (state->halted_at_save) {
+        if (state->saved_PC == 0u) {
+            return false;
+        }
+        adjusted_pc = (uint16_t)(state->saved_PC - 1u);
+    }
+
+    out[kPathE_LoadModeActive] = 1u;       /* arm load mode */
+    out[kPathE_ScratchF]       = state->saved_F;
+    out[kPathE_ScratchA]       = state->saved_A;
+    out[kPathE_ScratchC]       = state->saved_C;
+    out[kPathE_ScratchB]       = state->saved_B;
+    out[kPathE_ScratchE]       = state->saved_E;
+    out[kPathE_ScratchD]       = state->saved_D;
+    out[kPathE_ScratchL]       = state->saved_L;
+    out[kPathE_ScratchH]       = state->saved_H;
+    out[kPathE_SavedSpLo]      = (uint8_t)(state->saved_SP & 0xFFu);
+    out[kPathE_SavedSpHi]      = (uint8_t)((state->saved_SP >> 8) & 0xFFu);
+    out[kPathE_IffByte]        = state->saved_IFF ? FUSION_PATHE_IFF_BYTE_EI
+                                                  : FUSION_PATHE_IFF_BYTE_NOP;
+    out[kPathE_SavedA]         = state->saved_A;  /* re-restore A after FF50 */
+    out[kPathE_SavedPcLo]      = (uint8_t)(adjusted_pc & 0xFFu);
+    out[kPathE_SavedPcHi]      = (uint8_t)((adjusted_pc >> 8) & 0xFFu);
+    out[kPathE_GbresetRequest] = 0u;       /* caller toggles via separate writes */
+
+    return true;
+}
