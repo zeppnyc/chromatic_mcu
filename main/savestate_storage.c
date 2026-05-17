@@ -222,25 +222,27 @@ FusionStorageResult_t FusionStorage_InitFromPartition(FusionStorage_t *s,
     if (partition == NULL) {
         return kFusionStorage_NotImplemented;
     }
-    if (partition->size < sizeof(FusionStateHeader_t)) {
+    if (partition->size < (FUSION_STORAGE_DEFAULT_SLOTS * sizeof(FusionStateHeader_t))) {
         return kFusionStorage_OutOfSpace;
     }
 
     memset(s, 0, sizeof(*s));
     s->kind        = kFusionStorageBackend_Partition;
     s->partition   = partition;
-    s->slot_count  = 1u;
-    s->slot_size   = partition->size;
-    s->slots       = &s->partition_slot;
+    s->slot_count  = FUSION_STORAGE_DEFAULT_SLOTS;
+    s->slot_size   = partition->size / FUSION_STORAGE_DEFAULT_SLOTS;
+    s->slots       = s->partition_slots;
     s->active_slot = -1;
     s->initialized = true;
 
-    s->partition_slot.slot_offset       = 0u;
-    s->partition_slot.slot_size         = partition->size;
-    s->partition_slot.header_offset     = 0u;
-    s->partition_slot.payload_offset    = (uint32_t)sizeof(FusionStateHeader_t);
-    s->partition_slot.bytes_used        = (uint32_t)sizeof(FusionStateHeader_t);
-    s->partition_slot.write_in_progress = false;
+    for (uint32_t i = 0u; i < s->slot_count; ++i) {
+        s->slots[i].slot_offset       = i * s->slot_size;
+        s->slots[i].slot_size         = s->slot_size;
+        s->slots[i].header_offset     = i * s->slot_size;
+        s->slots[i].payload_offset    = i * s->slot_size + (uint32_t)sizeof(FusionStateHeader_t);
+        s->slots[i].bytes_used        = (uint32_t)sizeof(FusionStateHeader_t);
+        s->slots[i].write_in_progress = false;
+    }
     return kFusionStorage_Ok;
 #else
     (void)s;
@@ -473,6 +475,38 @@ FusionStorageResult_t FusionStorage_AbortSlotWrite(FusionStorage_t *s)
     slot->write_in_progress = false;
     s->active_slot = -1;
     s->has_staged_header = false;
+    return kFusionStorage_Ok;
+}
+
+FusionStorageResult_t FusionStorage_InvalidateSlot(FusionStorage_t *s,
+                                                   uint32_t slot_index)
+{
+    if (s == NULL || !s->initialized) {
+        return kFusionStorage_NotInitialized;
+    }
+    if (slot_index >= s->slot_count) {
+        return kFusionStorage_BadArg;
+    }
+
+    FusionStorageSlot_t *slot = &s->slots[slot_index];
+    FusionStateHeader_t hdr;
+    FusionStorageResult_t r =
+        ReadStorage(s, slot->header_offset, (uint8_t *)&hdr, sizeof(hdr));
+    if (r != kFusionStorage_Ok) {
+        return r;
+    }
+
+    hdr.magic = 0u;
+    hdr.commit_state = (uint8_t)kFusionCommit_Invalid;
+    r = WriteStorage(s, slot->header_offset, (const uint8_t *)&hdr, (uint32_t)sizeof(hdr));
+    if (r != kFusionStorage_Ok) {
+        return r;
+    }
+    if (s->active_slot == (int32_t)slot_index) {
+        slot->write_in_progress = false;
+        s->active_slot = -1;
+        s->has_staged_header = false;
+    }
     return kFusionStorage_Ok;
 }
 

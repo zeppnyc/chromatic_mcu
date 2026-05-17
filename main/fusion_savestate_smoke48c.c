@@ -892,7 +892,8 @@ static bool ValidateSlotQuiet(uint32_t *generation_out, const char *moment)
     }
     const bool tag_ok =
         (memcmp(hdr.savestate_tag, "P48C", 4u) == 0) ||
-        (memcmp(hdr.savestate_tag, "P48D", 4u) == 0);
+        (memcmp(hdr.savestate_tag, "P48D", 4u) == 0) ||
+        (memcmp(hdr.savestate_tag, "P48E", 4u) == 0);
     if (hdr.magic != FUSION_SAVESTATE_MAGIC ||
         hdr.format_version != FUSION_SAVESTATE_FORMAT_VERSION ||
         hdr.header_size != sizeof(FusionStateHeader_t) ||

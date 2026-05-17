@@ -45,7 +45,7 @@ enum {
 };
 
 static const char *TAG = "SvProbe";
-static const uint32_t kExpectedBitmap = 0x0000120Fu;
+static const uint32_t kExpectedBitmap = 0x0000320Fu;
 
 typedef struct {
     const char *name;
@@ -659,9 +659,8 @@ static bool ValidateHeader(const uint8_t *data)
                (unsigned long)kExpectedBitmap);
         return false;
     }
-    if (memcmp(&data[12], "P48C", 4u) != 0 &&
-        memcmp(&data[12], "P48D", 4u) != 0) {
-        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48C' or 'P48D'\n",
+    if (memcmp(&data[12], "P48E", 4u) != 0) {
+        printf("SvProbe: Header tag mismatch got='%c%c%c%c' want='P48E'\n",
                data[12], data[13], data[14], data[15]);
         return false;
     }

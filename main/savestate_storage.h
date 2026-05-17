@@ -38,6 +38,8 @@ typedef enum {
     kFusionStorageBackend_Partition,  /* ESP-IDF custom data partition */
 } FusionStorageBackendKind_t;
 
+#define FUSION_STORAGE_DEFAULT_SLOTS 2u
+
 typedef struct {
     uint32_t slot_offset;             /* offset into backing store */
     uint32_t slot_size;
@@ -57,14 +59,12 @@ typedef struct {
     uint32_t  slot_size;
 
     FusionStorageSlot_t *slots;       /* length == slot_count */
-    FusionStorageSlot_t  partition_slot;
+    FusionStorageSlot_t  partition_slots[FUSION_STORAGE_DEFAULT_SLOTS];
     FusionStateHeader_t  staged_header;
     bool                 has_staged_header;
     int32_t   active_slot;            /* slot being staged, -1 if none */
     bool      initialized;
 } FusionStorage_t;
-
-#define FUSION_STORAGE_DEFAULT_SLOTS 2u
 
 /*
  * Initialize a mock backend over caller-provided RAM. Backing memory is
@@ -114,6 +114,10 @@ FusionStorageResult_t FusionStorage_VerifyAndCommit(FusionStorage_t *s);
 
 /* Mark the staged slot 'Invalid' and release the in-progress lock. */
 FusionStorageResult_t FusionStorage_AbortSlotWrite(FusionStorage_t *s);
+
+/* Mark an already-written slot invalid so it cannot be selected for load. */
+FusionStorageResult_t FusionStorage_InvalidateSlot(FusionStorage_t *s,
+                                                   uint32_t slot_index);
 
 /*
  * Pick the slot with the highest commit_generation among slots whose

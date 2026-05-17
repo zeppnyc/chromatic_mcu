@@ -26,6 +26,7 @@ typedef enum MutexKey
     kMutexKey_ScreenTransitCtl,
     kMutexKey_Brightness,
     kMutexKey_PlayerNum,
+    kMutexKey_OSD,        /* Path-e (4.8d): savestate toast widget state */
     kNumMutexKeys,
 
     kMutexKey_FirstKey = kMutexKey_Buttons,

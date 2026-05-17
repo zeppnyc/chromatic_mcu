@@ -26,4 +26,32 @@
 
 bool FusionSavestate_QuickSaveSlot0(void);
 bool FusionSavestate_QuickLoadSlot0(void);
+
+/*
+ * Historical compatibility entry point.  It now dispatches to
+ * FusionSavestate_QuickLoadSlot0(), which uses the Design Lock local
+ * restore path: Top/CPU/Timer/HRAM/WRAM writes followed by WRITE_COMMIT.
+ */
+bool FusionSavestate_QuickLoadSlot0_PathE(void);
+
 void FusionSavestateSmoke48a_RegisterCommands(void);
+
+/* ----- Chord-triggered dispatcher ----- */
+
+#include "button.h"
+
+/*
+ * Initialize the chord dispatcher task and queue.  Call once during MCU
+ * boot (in main.c, after Button_RegisterCommands).  The task consumes
+ * save/load chord events and runs the corresponding QuickSave/QuickLoad
+ * synchronously.  Save/load are slow (UART transfer of WRAM), so this
+ * decouples them from the FPGA RX task.
+ */
+void FusionSavestate_StartChordDispatcher(void);
+
+/*
+ * Post a chord event to the dispatcher.  Safe to call from FPGA RX task.
+ * Drops the event silently if the queue is full (prevents button spam
+ * from queuing many save attempts).
+ */
+void FusionSavestate_PostChordRequest(ButtonChordEvent_t event);
