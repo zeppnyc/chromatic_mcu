@@ -2,6 +2,7 @@
 
 #include "battery.h"
 #include "brightness.h"
+#include "button.h"  /* savestate chord detection */
 #include "color_correct_lcd.h"
 #include "color_correct_usb.h"
 #include "crc8_sae_j1850.h"
@@ -13,6 +14,7 @@
 #include "frameblend.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "fusion_savestate_smoke48a.h"  /* FusionSavestate_PostChordRequest */
 #include "fw.h"
 #include "osd.h"
 #include "pwrmgr.h"
@@ -315,6 +317,17 @@ static void ProcessMessage(const RxMsg_t *const pMsg)
         }
         case kRxCmd_Buttons:
             Button_Update(rxdata);
+            /*
+             * Chord detection.  Fires Save/LoadRequested on MENU+DOWN / MENU+UP
+             * held for the chord threshold.  The actual save/load is dispatched
+             * via the savestate request queue.
+             */
+            {
+                ButtonChordEvent_t chord = ButtonChord_Update(rxdata);
+                if (chord != kButtonChord_None) {
+                    FusionSavestate_PostChordRequest(chord);
+                }
+            }
             if ((rxdata & kButtonBits_MenuEnAlt) != 0 || (rxdata & kButtonBits_MenuEn) != 0)
             {
                 OSD_SetVisiblityState(false);
