@@ -24,6 +24,7 @@
 typedef uint32_t TickType_t;
 #endif
 
+// To get voltage to appear in menu, uncomment "// #define BATT_DISP_VOLTAGE"
 // #define BATT_DISP_TEST
 // #define BATT_DISP_VOLTAGE
 // #define FILTER_BATT_DATA

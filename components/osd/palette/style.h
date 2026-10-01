@@ -36,6 +36,8 @@ StyleID_t Style_GetCurrID(void);
 OSD_Result_t Style_ApplySetting(const SettingValue_t* pValue);
 void Style_RegisterOnUpdateCb(fnOnUpdateCb_t fnOnUpdate);
 void Style_SetGBCMode(const bool GBCMode);
+bool Style_IsGBCMode(void);
 void Style_SetHKPalette(const uint64_t bootPalette);
+void Style_CycleFromHotkey(bool upPressed);
 bool Style_IsInitialized(void);
 void Style_Initialize(void);

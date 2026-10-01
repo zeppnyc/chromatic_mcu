@@ -52,5 +52,6 @@ Ensure you are part of the `dialout` group. You will need to log out and log bac
 sudo gpasswd --add $USER dialout
 ```
 
-If everything is working, you should see `/dev/ttyACM0` appear as the communications port to the MCU.
+If everything is working, you should see `/dev/ttyACM0` appear as the communications port to the MCU.  
 
+If this `idf.py` command above fails, you may need to check your system's `udev` rules.

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdbool.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -23,6 +24,7 @@
 #include "fpga_tx.h"
 #include "frameblend.h"
 #include "fw.h"
+#include "gbc_color_temp.h"
 #include "osd.h"
 #include "osd_default.h"
 #include "low_batt_icon_ctl.h"
@@ -155,6 +157,7 @@ static void register_update_callbacks(void)
     LowBattIconCtl_RegisterOnUpdateCb(FPGA_Tx_SendSysCtl);
     Button_RegisterOnButtonPokeCb(FPGA_Tx_PokeButtons);
     Style_RegisterOnUpdateCb(FPGA_Tx_WritePaletteStyle);
+    GBCColorTemp_RegisterOnUpdateCb(FPGA_Tx_WriteColorTemp);
 }
 
 static void persist_storage_init(void)
@@ -175,6 +178,7 @@ static void persist_storage_init(void)
         [kSettingKey_DPadCtl]          = DPadCtl_ApplySetting,
         [kSettingKey_LowBattIconCtl]   = LowBattIconCtl_ApplySetting,
         [kSettingKey_PaletteStyleID]   = Style_ApplySetting,
+        [kSettingKey_GBCColorTemp]     = GBCColorTemp_ApplySetting,
     };
 
     OSD_Result_t eResult;

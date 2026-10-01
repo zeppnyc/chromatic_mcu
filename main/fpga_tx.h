@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 typedef enum {
     kFPGA_TxConsts_BufferSize = 1024,    // [bytes]
 } FPGA_TxConsts_t;
@@ -12,3 +14,4 @@ void FPGA_Tx_WriteBrightness(void);
 void FPGA_Tx_SendSysCtl(void);
 void FPGA_Tx_PokeButtons(void);
 void FPGA_Tx_WritePaletteStyle(void);
+void FPGA_Tx_WriteColorTemp(void);

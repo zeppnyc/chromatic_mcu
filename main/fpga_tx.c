@@ -13,6 +13,7 @@
 #include "frameblend.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "gbc_color_temp.h"
 #include "low_batt_icon_ctl.h"
 #include "palette.h"
 #include "player_num.h"
@@ -31,6 +32,7 @@ enum {
     kFlag_RequestFWVer,
     kFlag_PokeButton,
     kFlag_SetPaletteStyle,
+    kFlag_SetColorTemp,
     kFlag_RequestBGPD,
     kNumFlags,
 };
@@ -42,6 +44,7 @@ typedef enum {
     kTxFlag_RequestFWVer     = (1 << kFlag_RequestFWVer),
     kTxFlag_PokeButton       = (1 << kFlag_PokeButton),
     kTxFlag_SetPaletteStyle  = (1 << kFlag_SetPaletteStyle),
+    kTxFlag_SetColorTemp     = (1 << kFlag_SetColorTemp),
     kTxFlag_RequestBGPD      = (1 << kFlag_RequestBGPD),
 
     kTxFlag_AllFlags         = ((1 << kNumFlags) - 1),
@@ -59,6 +62,8 @@ typedef enum {
     kTxCmd_BGPaletteCtl     = 0xB,
     kTxCmd_SpritePaletteCtl = 0xC,
     kTxCmd_ReqBGPD          = 0xD,
+    // Keep this in sync with FPGA system_monitor.sv rx_address == 7'hE.
+    kTxCmd_GBCColorTemp     = 0xE,
 
     kNumTxCmds,
 } TxIDs_t;
@@ -96,7 +101,7 @@ void FPGA_TxTask(void *arg)
 
         const EventBits_t EventBits = xEventGroupWaitBits(
             xEventGroupHandle,
-            (kTxFlag_WriteBrightness | kTxFlag_SetSysCtl | kTxFlag_RequestFWVer | kTxFlag_PokeButton | kTxFlag_SetPaletteStyle | kTxFlag_RequestBGPD),
+            (kTxFlag_WriteBrightness | kTxFlag_SetSysCtl | kTxFlag_RequestFWVer | kTxFlag_PokeButton | kTxFlag_SetPaletteStyle | kTxFlag_SetColorTemp | kTxFlag_RequestBGPD),
             pdTRUE, // DO clear the flags to complete the request
             pdFALSE, // Any bit will do
             pdMS_TO_TICKS(100)
@@ -154,33 +159,46 @@ void FPGA_TxTask(void *arg)
 
         if ((EventBits & kTxFlag_SetPaletteStyle) == kTxFlag_SetPaletteStyle)
         {
-            if (!Style_IsInitialized())
+            const bool IsGBCMode = Style_IsGBCMode();
+
+            if (!IsGBCMode && !Style_IsInitialized())
             {
                 // Prevent palette from being sent fast on initial SendAll()s
                 // so that there is time to read back the hotkey data from FPGA
                 vTaskDelay( pdMS_TO_TICKS(50) );
                 Style_Initialize();
             }
-            const StyleID_t ID = Style_GetCurrID();
-            const uint64_t ColorBG = Pal_GetColor(ID, kPalette_Bg);
-            // toggle custom palette enable bit
-            const uint64_t PayloadBG = __builtin_bswap64(ColorBG ^ ((uint64_t)1 << kCustomPaletteEn));
 
-            // BG
-            const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_BGPaletteCtl, sizeof(PayloadBG), (void*)&PayloadBG);
+            if (!IsGBCMode)
+            {
+                const StyleID_t ID = Style_GetCurrID();
+                const uint64_t ColorBG = Pal_GetColor(ID, kPalette_Bg);
+                // toggle custom palette enable bit
+                const uint64_t PayloadBG = __builtin_bswap64(ColorBG ^ ((uint64_t)1 << kCustomPaletteEn));
+
+                // BG
+                const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_BGPaletteCtl, sizeof(PayloadBG), (void*)&PayloadBG);
+                (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
+
+                // Sprite - Obj0
+                const uint64_t ColorObj0 = Pal_GetColor(ID, kPalette_Obj0);
+                const uint64_t PayloadObj0 = __builtin_bswap64(ColorObj0);
+                const size_t Size2 = SetupTxBuffer(TxBuffer, kTxCmd_SpritePaletteCtl, sizeof(PayloadObj0), (void*)&PayloadObj0);
+                (void)uart_write_bytes(UART_NUM_1, TxBuffer, Size2);
+
+                // Sprite - Obj1
+                const uint64_t ColorObj1 = Pal_GetColor(ID, kPalette_Obj1);
+                const uint64_t PayloadObj1 = __builtin_bswap64(ColorObj1 | ((uint64_t)1 << kCustomPaletteObjSel));
+                const size_t Size3 = SetupTxBuffer(TxBuffer, kTxCmd_SpritePaletteCtl, sizeof(PayloadObj1), (void*)&PayloadObj1);
+                (void)uart_write_bytes(UART_NUM_1, TxBuffer, Size3);
+            }
+        }
+
+        if ((EventBits & kTxFlag_SetColorTemp) == kTxFlag_SetColorTemp)
+        {
+            const uint16_t payload = (uint16_t)GBCColorTemp_GetLevel();
+            const size_t Size = SetupTxBuffer(TxBuffer, kTxCmd_GBCColorTemp, sizeof(payload), (void*)&payload);
             (void) uart_write_bytes(UART_NUM_1, TxBuffer, Size);
-
-            // Sprite - Obj0
-            const uint64_t ColorObj0 = Pal_GetColor(ID, kPalette_Obj0);
-            const uint64_t PayloadObj0 = __builtin_bswap64(ColorObj0);
-            const size_t Size2 = SetupTxBuffer(TxBuffer, kTxCmd_SpritePaletteCtl, sizeof(PayloadObj0), (void*)&PayloadObj0);
-            (void)uart_write_bytes(UART_NUM_1, TxBuffer, Size2);
-
-            // Sprite - Obj1
-            const uint64_t ColorObj1 = Pal_GetColor(ID, kPalette_Obj1);
-            const uint64_t PayloadObj1 = __builtin_bswap64(ColorObj1 | ((uint64_t)1 << kCustomPaletteObjSel));
-            const size_t Size3 = SetupTxBuffer(TxBuffer, kTxCmd_SpritePaletteCtl, sizeof(PayloadObj1), (void*)&PayloadObj1);
-            (void)uart_write_bytes(UART_NUM_1, TxBuffer, Size3);
         }
 
         memset(TxBuffer, 0x0, sizeof(TxBuffer));
@@ -222,6 +240,14 @@ void FPGA_Tx_PokeButtons(void)
 void FPGA_Tx_WritePaletteStyle(void)
 {
    (void) xEventGroupSetBits(xEventGroupHandle, kTxFlag_SetPaletteStyle);
+}
+
+void FPGA_Tx_WriteColorTemp(void)
+{
+    if (xEventGroupHandle != NULL)
+    {
+        (void) xEventGroupSetBits(xEventGroupHandle, kTxFlag_SetColorTemp);
+    }
 }
 
 static size_t SetupTxBuffer(uint8_t *const pBuffer, TxIDs_t eID, uint8_t Len, void* pData)

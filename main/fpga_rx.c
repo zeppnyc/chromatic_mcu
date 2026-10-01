@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "fw.h"
+#include "gbc_color_temp.h"
 #include "osd.h"
 #include "pwrmgr.h"
 #include "player_num.h"
@@ -29,6 +30,14 @@ typedef enum {
     kRxFlag_Resume = (1 << 0),
     kRxFlag_UseBrightness = (1 << 1),
 } RxFlags_t;
+
+enum {
+    kPaletteHotkeyEvent_None = 0,
+    kPaletteHotkeyEvent_Up = 1,
+    kPaletteHotkeyEvent_Down = 2,
+    kPaletteHotkeyEventMask = 0x3,
+    kStatusExtendedPaletteHotkeyByteIndex = 2,
+};
 
 typedef enum {
     kScanForHeaderMarker,
@@ -285,18 +294,41 @@ static void ProcessMessage(const RxMsg_t *const pMsg)
     {
         case kRxCmd_VoltageAA:
         {
-            result = (float)rxdata/2048.0f;
-            result = (10.0f + 2.2f)*(result/(2.2f));
-            float aa_voltage = result - 0.1f;
-            Battery_UpdateVoltage(aa_voltage, kBatteryKind_AA);
+           uint8_t pcb_version = (rxdata >> 15); 
+           result = (float)(rxdata & 0x7FFF)/2048.0f;
+
+           if (pcb_version == 1) {
+                // rev 100-0843-02 
+                // scale factor of 0.9 emprically determined, maintains compatibility
+                // should bias be added/subtracted as with pcb_version 0?
+                result = 0.9 * (470.0f + 100.0f)*(result/(100.0f));
+            } else if (pcb_version == 0) {
+                // rev 100-0171_06
+                result = (10.0f + 2.2f)*(result/(2.2f));
+                result = result - 0.1f;
+                
+           }
+
+            Battery_UpdateVoltage(result, kBatteryKind_AA);
             break;
         }
         case kRxCmd_VoltageLiPo:
         {
-            result = (float)rxdata/2048.0f;
-            result = (10.0f + 2.2f)*(result/(2.2f));
-            float lipo_voltage = result - 0.1f;
-            Battery_UpdateVoltage(lipo_voltage, kBatteryKind_LiPo);
+           uint8_t pcb_version = (rxdata >> 15); 
+           result = (float)(rxdata & 0x7FFF)/2048.0f;
+
+           if (pcb_version == 1) {
+                // rev 100-0843-02
+                // scale factor of 0.9 emprically determined, maintains compatibility
+                // should bias be added/subtracted as with pcb_version 0?
+                result = 0.9*(470.0f + 100.0f)*(result/(100.0f));
+            } else if (pcb_version == 0) {
+                // rev 100-0171_06
+                result = (10.0f + 2.2f)*(result/(2.2f));
+                result = result - 0.1f;
+           }
+
+            Battery_UpdateVoltage(result, kBatteryKind_LiPo);
             break;
         }
         case kRxCmd_Buttons:
@@ -365,6 +397,30 @@ static void ProcessMessage(const RxMsg_t *const pMsg)
 
             PwrMgr_SetLPM(InLPM);
             Style_SetGBCMode(GBCMode);
+
+            if ((pMsg->Len >= 2) && !OSD_IsVisible())
+            {
+                const GBCColorTempLevel_t RuntimeColorTempLevel = (GBCColorTempLevel_t)(pMsg->Payload[1] & 0x7);
+                GBCColorTemp_Update(RuntimeColorTempLevel);
+            }
+
+            if ((pMsg->Len >= 3) && !OSD_IsVisible() && !GBCMode)
+            {
+                const uint8_t paletteHotkeyPayload = pMsg->Payload[kStatusExtendedPaletteHotkeyByteIndex];
+                const uint8_t paletteHotkeyEvent = (uint8_t)(paletteHotkeyPayload & kPaletteHotkeyEventMask);
+                if (paletteHotkeyEvent == kPaletteHotkeyEvent_Up)
+                {
+                    // Palette hotkey updates require MCU->FPGA palette writes.
+                    // Ensure TX is active while OSD is hidden.
+                    FPGA_Tx_Resume();
+                    Style_CycleFromHotkey(true);
+                }
+                else if (paletteHotkeyEvent == kPaletteHotkeyEvent_Down)
+                {
+                    FPGA_Tx_Resume();
+                    Style_CycleFromHotkey(false);
+                }
+            }
             break;
         }
         case kRxCmd_Reserved:

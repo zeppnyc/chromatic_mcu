@@ -4,6 +4,7 @@ idf_component_register(SRCS
                         "controls/dpad_ctl.c"
                         "controls/hotkeys.c"
                         "palette/palette.c"
+                        "palette/gbc_color_temp.c"
                         "palette/style.c"
                         "display/frameblend.c"
                         "display/color_correct_lcd.c"

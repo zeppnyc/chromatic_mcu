@@ -10,10 +10,10 @@
 #include "status/brightness.h"
 #include "controls/dpad_ctl.h"
 #include "controls/hotkeys.h"
+#include "palette/gbc_color_temp.h"
 #include "palette/style.h"
 #include "display/color_correct_lcd.h"
 #include "display/color_correct_usb.h"
-#include "display/frameblend.h"
 #include "display/frameblend.h"
 #include "display/low_batt_icon_ctl.h"
 #include "display/screen_transit_ctl.h"
@@ -24,19 +24,25 @@
 #include "osd_shared.h"
 #include "esp_log.h"
 
+#include <stdint.h>
+
 static const char *TAG = "OSDDef";
 
 LV_IMG_DECLARE(menu_status);
 LV_IMG_DECLARE(menu_display);
 LV_IMG_DECLARE(menu_controls);
 LV_IMG_DECLARE(menu_palette);
+LV_IMG_DECLARE(menu_palette_gbc);
 LV_IMG_DECLARE(menu_system);
 
 static void CreateMenuStatus(lv_obj_t *const pScreen);
 static void CreateMenuDisplay(lv_obj_t *const pScreen);
 static void CreateMenuControls(lv_obj_t *const pScreen);
 static void CreateMenuPalette(lv_obj_t *const pScreen);
+static void CreateMenuColorTemp(lv_obj_t *const pScreen);
 static void CreateMenuSystem(lv_obj_t *const pScreen);
+static bool IsPaletteTabActive(void);
+static bool IsColorTempTabActive(void);
 
 void OSD_Default_Init(lv_obj_t *const pScreen)
 {
@@ -66,6 +72,7 @@ void OSD_Default_Init(lv_obj_t *const pScreen)
     CreateMenuDisplay(pScreen);
     CreateMenuControls(pScreen);
     CreateMenuPalette(pScreen);
+    CreateMenuColorTemp(pScreen);
     CreateMenuSystem(pScreen);
 
     OSD_AddWidget(&Battery);
@@ -271,18 +278,45 @@ static void CreateMenuControls(lv_obj_t *const pScreen)
         return;
     }
 
-    static TabItem_t HotKeys = {
+    static TabItem_t HotKeysBrightness = {
         .Widget = {
-            .Name = "HotKeys",
-            .fnDraw = HotKeys_Draw,
+            .Name = "HK: BRIGHTNESS",
+            .fnDraw = HotKeys_DrawBrightness,
             .fnOnTransition = HotKeys_OnTransition,
-            .fnOnButton = HotKeys_OnButton,
         },
     };
 
-    if ((eResult = Tab_AddItem(pList, &HotKeys, pScreen)) != kOSD_Result_Ok)
+    if ((eResult = Tab_AddItem(pList, &HotKeysBrightness, pScreen)) != kOSD_Result_Ok)
     {
-        ESP_LOGE(TAG, "%s tab item init failed %d", DPad.Widget.Name, eResult);
+        ESP_LOGE(TAG, "%s tab item init failed %d", HotKeysBrightness.Widget.Name, eResult);
+        return;
+    }
+
+    static TabItem_t HotKeysColorTemp = {
+        .Widget = {
+            .Name = "HK: PAL/COLOR TEMP",
+            .fnDraw = HotKeys_DrawColorTemp,
+            .fnOnTransition = HotKeys_OnTransition,
+        },
+    };
+
+    if ((eResult = Tab_AddItem(pList, &HotKeysColorTemp, pScreen)) != kOSD_Result_Ok)
+    {
+        ESP_LOGE(TAG, "%s tab item init failed %d", HotKeysColorTemp.Widget.Name, eResult);
+        return;
+    }
+
+    static TabItem_t HotKeysResetEmu = {
+        .Widget = {
+            .Name = "HK: RESET EMU",
+            .fnDraw = HotKeys_DrawResetEmulation,
+            .fnOnTransition = HotKeys_OnTransition,
+        },
+    };
+
+    if ((eResult = Tab_AddItem(pList, &HotKeysResetEmu, pScreen)) != kOSD_Result_Ok)
+    {
+        ESP_LOGE(TAG, "%s tab item init failed %d", HotKeysResetEmu.Widget.Name, eResult);
         return;
     }
 
@@ -296,25 +330,26 @@ static void CreateMenuControls(lv_obj_t *const pScreen)
 
 static void CreateMenuPalette(lv_obj_t *const pScreen)
 {
-    static TabCollection_t PaletteList;
-    TabCollection_t *pList = &PaletteList;
-    OSD_Result_t eResult;
-
-    sys_dlist_init(&PaletteList.WidgetList);
-
+    static TabCollection_t PaletteListGB;
+    static TabItem_t PaletteOpts[kNumPalettes];
     static MenuTab_t Tab_Palette = {
         .Widget = {
             .Name = "MenuPalette",
             .fnDraw = TabTable_Draw,
-            .fnOnButton = Tab_OnButton, 
+            .fnOnButton = Tab_OnButton,
             .fnOnTransition =  TabList_OnTransition,  // TabTable has same object lifetime behavior as TabList
         },
         .pImageDesc = &menu_palette,
-        .Menu = &PaletteList,
+        .Menu = &PaletteListGB,
+        .fnIsActive = IsPaletteTabActive,
     };
+
+    OSD_Result_t eResult;
+
+    sys_dlist_init(&PaletteListGB.WidgetList);
+
     Tab_Palette.Accent = lv_color_make(0x92, 0x4E, 0xD7);  // Unused in actual selection
 
-    static TabItem_t PaletteOpts[kNumPalettes];
     const char *PaletteStyleNames[kNumPalettes] = {
         [kPalette_Default]   = "DEFAULT",
         [kPalette_Brown]     = "BROWN",          // Up
@@ -344,7 +379,7 @@ static void CreateMenuPalette(lv_obj_t *const pScreen)
             },
         };
 
-        if ((eResult = Tab_AddItem(pList, &PaletteOpts[ID], pScreen)) != kOSD_Result_Ok)
+        if ((eResult = Tab_AddItem(&PaletteListGB, &PaletteOpts[ID], pScreen)) != kOSD_Result_Ok)
         {
             ESP_LOGE(TAG, "%s tab item init failed %d", PaletteOpts[ID].Widget.Name, eResult);
             return;
@@ -356,6 +391,60 @@ static void CreateMenuPalette(lv_obj_t *const pScreen)
         ESP_LOGE(TAG, "%s widget init failed %d", Tab_Palette.Widget.Name, eResult);
         return;
     }
+}
+
+static void CreateMenuColorTemp(lv_obj_t *const pScreen)
+{
+    static TabCollection_t ColorTempList;
+    static TabItem_t ColorTempItem;
+    static MenuTab_t Tab_ColorTemp = {
+        .Widget = {
+            .Name = "MenuColorTemp",
+            .fnDraw = TabList_Draw,
+            .fnOnButton = Tab_OnButton,
+            .fnOnTransition = TabList_OnTransition,
+        },
+        .pImageDesc = &menu_palette_gbc,
+        .Menu = &ColorTempList,
+        .fnIsActive = IsColorTempTabActive,
+    };
+
+    OSD_Result_t eResult;
+
+    sys_dlist_init(&ColorTempList.WidgetList);
+
+    Tab_ColorTemp.Accent = lv_color_make(0x92, 0x4E, 0xD7);
+
+    ColorTempItem = (TabItem_t){
+        .Widget = {
+            .Name = "COLOR TEMP",
+            .fnDraw = GBCColorTemp_Draw,
+            .fnOnButton = GBCColorTemp_OnButton,
+            .fnOnTransition = GBCColorTemp_OnTransition,
+        },
+    };
+
+    if ((eResult = Tab_AddItem(&ColorTempList, &ColorTempItem, pScreen)) != kOSD_Result_Ok)
+    {
+        ESP_LOGE(TAG, "%s tab item init failed %d", ColorTempItem.Widget.Name, eResult);
+        return;
+    }
+
+    if ((eResult = MenuMgr_AddTab(kTabID_ColorTemp, &Tab_ColorTemp)) != kOSD_Result_Ok)
+    {
+        ESP_LOGE(TAG, "%s widget init failed %d", Tab_ColorTemp.Widget.Name, eResult);
+        return;
+    }
+}
+
+static bool IsPaletteTabActive(void)
+{
+    return !Style_IsGBCMode();
+}
+
+static bool IsColorTempTabActive(void)
+{
+    return Style_IsGBCMode();
 }
 
 static void CreateMenuSystem(lv_obj_t *const pScreen)

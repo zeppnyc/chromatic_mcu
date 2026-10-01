@@ -6,6 +6,7 @@
 #include "button.h"
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef struct MenuMgrCtx
@@ -26,6 +27,8 @@ static OSD_Result_t MenuMgr_Draw(void* arg);
 static OSD_Result_t MenuMgr_OnTransition(void *arg);
 static void MenuMgr_NextTab(void);
 static void MenuMgr_PrevTab(void);
+static bool MenuMgr_IsTabActive(TabID_t eID);
+static TabID_t MenuMgr_FindNextActiveTab(TabID_t eFrom, bool forward);
 
 OSD_Result_t MenuMgr_Initialize(OSD_Widget_t* const pWidget, lv_obj_t *const pScreen)
 {
@@ -165,30 +168,75 @@ static OSD_Result_t MenuMgr_OnButton(const Button_t Button, const ButtonState_t 
 
 static void MenuMgr_NextTab(void)
 {
-    TabID_t eNextID = _Ctx.eCurTab + 1;
-    if (eNextID >= kNumTabIDs)
+    const TabID_t eNextID = MenuMgr_FindNextActiveTab(_Ctx.eCurTab, true);
+
+    if (eNextID == _Ctx.eCurTab)
     {
-        eNextID = kTabID_First;
+        return;
     }
 
     // Clean up the old tab data
-    MenuMgr_OnTransition(NULL);
-
+    (void)MenuMgr_OnTransition(NULL);
     _Ctx.eCurTab = eNextID;
 }
 
 static void MenuMgr_PrevTab(void)
 {
-    TabID_t ePrevID = _Ctx.eCurTab - 1;
-    if ((signed) ePrevID < 0)
+    const TabID_t ePrevID = MenuMgr_FindNextActiveTab(_Ctx.eCurTab, false);
+
+    if (ePrevID == _Ctx.eCurTab)
     {
-        ePrevID = kTabID_Last;
+        return;
     }
 
     // Clean up the old tab data
-    MenuMgr_OnTransition(NULL);
-
+    (void)MenuMgr_OnTransition(NULL);
     _Ctx.eCurTab = ePrevID;
+}
+
+static bool MenuMgr_IsTabActive(TabID_t eID)
+{
+    if ((unsigned)eID >= kNumTabIDs)
+    {
+        return false;
+    }
+
+    MenuTab_t *const pTab = _Ctx.pMenus[eID];
+    if (pTab == NULL)
+    {
+        return false;
+    }
+
+    if (pTab->fnIsActive == NULL)
+    {
+        return true;
+    }
+
+    return pTab->fnIsActive();
+}
+
+static TabID_t MenuMgr_FindNextActiveTab(TabID_t eFrom, bool forward)
+{
+    TabID_t eCandidate = eFrom;
+
+    for (size_t i = 0; i < kNumTabIDs; i++)
+    {
+        if (forward)
+        {
+            eCandidate = (eCandidate + 1 >= kNumTabIDs) ? kTabID_First : eCandidate + 1;
+        }
+        else
+        {
+            eCandidate = ((signed)eCandidate - 1 < 0) ? kTabID_Last : eCandidate - 1;
+        }
+
+        if (MenuMgr_IsTabActive(eCandidate))
+        {
+            return eCandidate;
+        }
+    }
+
+    return eFrom;
 }
 
 static OSD_Result_t MenuMgr_OnTransition(void *arg)

@@ -22,6 +22,7 @@ idf_component_register(SRCS
     "menu_controls.c"
     "menu_display.c"
     "menu_palette.c"
+    "menu_palette_gbc.c"
     "menu_status.c"
     "menu_system.c"
     REQUIRES lvgl

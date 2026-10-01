@@ -252,6 +252,11 @@ void Style_SetGBCMode(const bool GBCMode)
     _Ctx.GBCMode = GBCMode;
 }
 
+bool Style_IsGBCMode(void)
+{
+    return _Ctx.GBCMode;
+}
+
 void Style_SetHKPalette(const uint64_t bootPalette)
 {
     for (StyleID_t i = 0; i < kNumPalettes; i++) {
@@ -276,6 +281,20 @@ void Style_SetHKPalette(const uint64_t bootPalette)
             break;
         }
     }
+}
+
+void Style_CycleFromHotkey(bool upPressed)
+{
+    if (_Ctx.GBCMode)
+    {
+        return;
+    }
+
+    const StyleID_t NewID = upPressed ?
+        (_Ctx.CurrStyleID > 0 ? _Ctx.CurrStyleID - 1 : kNumPalettes - 1) :
+        ((_Ctx.CurrStyleID + 1) % kNumPalettes);
+
+    Style_Update(NewID);
 }
 
 bool Style_IsInitialized(void)

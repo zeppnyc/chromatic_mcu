@@ -1,3 +1,17 @@
+## v0.13.7
+
+### Changed
+- Change default value for usbcolorcorrection from 1->0.
+
+## v0.13.5
+
+### Note 
+The FPGA must be updated to v18.9 or newer for PCB-aware battery voltage estimate
+
+### Changed 
+- Uses most significant bit of 16-bit ADC packet sent from FPGA to determine which
+battery voltage calculation to execute.
+
 ## v0.13.4
 
 ### Note
